@@ -1,0 +1,6 @@
+"/vendor/" 
+"db.php" 
+".env" 
+"*.log" 
+".vscode/" 
+"*.swp" 
