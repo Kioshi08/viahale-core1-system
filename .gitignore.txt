@@ -1,0 +1,37 @@
+.gitignore
+``>
+**(make sure there's no `.txt` extension!)**
+
+3. Paste the following recommended contents:
+
+```gitignore
+# Ignore Composer dependencies
+/vendor/
+
+# Ignore sensitive config files (optional)
+.env
+.env.local
+db.php
+
+# Ignore log files and system files
+*.log
+*.DS_Store
+Thumbs.db
+
+# Ignore OS-specific hidden files
+.DS_Store
+ehthumbs.db
+Icon?
+desktop.ini
+
+# Ignore PHPStorm or VSCode project folders
+.idea/
+.vscode/
+
+# Ignore cache or temporary files
+*.bak
+*.tmp
+*.swp
+
+# Ignore uploaded files (optional)
+uploads/
