@@ -1,7 +1,7 @@
 <?php
 session_start();
 require 'vendor/autoload.php';
-require 'db.php'; // your DB connection
+require 'includes/db.php'; // your DB connection
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
 
@@ -17,7 +17,7 @@ $otp = rand(100000, 999999);
 $otp_expiration = date("Y-m-d H:i:s", strtotime("+5 minutes"));
 
 // Update OTP in the database
-$stmt = $conn->prepare("UPDATE users SET otp = ?, otp_expiration = ? WHERE username = ?");
+$stmt = $conn->prepare("UPDATE users SET otp = ?, otp_expiry = ? WHERE username = ?");
 $stmt->bind_param("sss", $otp, $otp_expiration, $username);
 $stmt->execute();
 $stmt->close();

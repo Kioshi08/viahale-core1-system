@@ -1,6 +1,6 @@
 <?php
 session_start();
-require 'db.php';
+require 'includes/db.php';
 require 'vendor/autoload.php'; // PHPMailer
 
 use PHPMailer\PHPMailer\PHPMailer;
@@ -17,6 +17,12 @@ if (isset($_POST['login'])) {
 
     if ($result->num_rows === 1) {
         $user = $result->fetch_assoc();
+
+        // Store both username & email in session BEFORE OTP
+        $_SESSION['username'] = $user['username']; // from DB, ensures exact match
+        $_SESSION['email']    = $user['email'];
+        $_SESSION['role']     = $user['role'];
+
         $otp = rand(100000, 999999);
         $otp_expiry = date("Y-m-d H:i:s", strtotime("+5 minutes"));
 

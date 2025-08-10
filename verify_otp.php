@@ -1,6 +1,6 @@
 <?php
 session_start();
-require 'db.php';
+require 'includes/db.php';
 
 if (!isset($_SESSION['email'])) {
     header("Location: login.php");
@@ -34,7 +34,23 @@ if (isset($_POST['verify'])) {
             $clear->execute();
 
             // Redirect to success page
-            header("Location: index.php");
+            switch ($_SESSION['username']) {
+                case 'dispatcher':
+                    header("Location: dispatcher/dispatcher_dashboard.php");
+                    break;
+                case 'admin1': // Operations Manager
+                    header("Location: operations/dashboard.php");
+                    break;
+                case 'fleetstaff':
+                    header("Location: fleet/dashboard.php");
+                    break;
+                case 'storeclerk':
+                    header("Location: store_clerk/dashboard.php");
+                    break;
+                default:
+                    header("Location: dashboard.php"); // fallback
+                    break;
+            }
             exit();
         } else {
             $error = "Invalid or expired OTP.";
