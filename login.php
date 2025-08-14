@@ -168,7 +168,7 @@ if (isset($_POST['login'])) {
 </head>
 <body>
     <div class="login-container">
-        <h2>Welcome back, Admin!</h2>
+        <h2>Welcome back, ViaHale!</h2>
         <p>Please enter your credentials to access the dashboard.</p>
 
         <form method="POST">
