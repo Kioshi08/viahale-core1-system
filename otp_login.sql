@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Host: localhost: 3307
--- Generation Time: Aug 10, 2025 at 04:24 PM
+-- Generation Time: Aug 16, 2025 at 04:28 AM
 -- Server version: 10.4.32-MariaDB
 -- PHP Version: 8.2.12
 
@@ -31,16 +31,22 @@ CREATE TABLE `drivers` (
   `id` int(11) NOT NULL,
   `name` varchar(100) NOT NULL,
   `phone` varchar(30) DEFAULT NULL,
-  `status` enum('available','on_trip','unavailable') DEFAULT 'available'
+  `status` enum('available','on_trip','unavailable') DEFAULT 'available',
+  `current_location_lat` decimal(10,8) DEFAULT NULL,
+  `current_location_lng` decimal(11,8) DEFAULT NULL,
+  `shift_end_time` time DEFAULT NULL,
+  `rating_average` decimal(3,2) DEFAULT 5.00
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 --
 -- Dumping data for table `drivers`
 --
 
-INSERT INTO `drivers` (`id`, `name`, `phone`, `status`) VALUES
-(1, 'John Doe', '09171234567', 'unavailable'),
-(2, 'Jane Smith', '09179876543', 'on_trip');
+INSERT INTO `drivers` (`id`, `name`, `phone`, `status`, `current_location_lat`, `current_location_lng`, `shift_end_time`, `rating_average`) VALUES
+(1, 'John Doe', '09171234567', 'on_trip', NULL, NULL, NULL, 5.00),
+(2, 'Jane Smith', '09179876543', 'on_trip', NULL, NULL, NULL, 5.00),
+(3, 'Patrick Martinez', '09171234567', 'on_trip', NULL, NULL, NULL, 5.00),
+(4, 'Fred Troy', '09914558732', 'on_trip', NULL, NULL, NULL, 5.00);
 
 -- --------------------------------------------------------
 
@@ -174,18 +180,29 @@ CREATE TABLE `trips` (
   `driver_id` int(11) DEFAULT NULL,
   `vehicle_id` int(11) DEFAULT NULL,
   `origin` varchar(255) DEFAULT NULL,
+  `pickup_lat` decimal(10,8) DEFAULT NULL,
+  `pickup_lng` decimal(11,8) DEFAULT NULL,
   `destination` varchar(255) DEFAULT NULL,
+  `dropoff_lat` decimal(10,8) DEFAULT NULL,
+  `dropoff_lng` decimal(11,8) DEFAULT NULL,
   `scheduled_time` datetime DEFAULT NULL,
   `status` enum('pending','ongoing','completed','cancelled') DEFAULT 'pending',
-  `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `priority` tinyint(1) DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 --
 -- Dumping data for table `trips`
 --
 
-INSERT INTO `trips` (`id`, `trip_code`, `passenger_name`, `driver_id`, `vehicle_id`, `origin`, `destination`, `scheduled_time`, `status`, `created_at`) VALUES
-(1, 'TRP68983F56C7FC2', 'Teddy Mangyan', 2, NULL, 'Taguig', 'Cavite', '2025-08-10 16:43:00', 'ongoing', '2025-08-10 06:42:30');
+INSERT INTO `trips` (`id`, `trip_code`, `passenger_name`, `driver_id`, `vehicle_id`, `origin`, `pickup_lat`, `pickup_lng`, `destination`, `dropoff_lat`, `dropoff_lng`, `scheduled_time`, `status`, `created_at`, `priority`) VALUES
+(1, 'TRP68983F56C7FC2', 'Teddy Mangyan', 2, NULL, 'Taguig', NULL, NULL, 'Cavite', NULL, NULL, '2025-08-10 16:43:00', 'ongoing', '2025-08-10 06:42:30', 0),
+(2, 'TRP1AFDE3500E88', 'Jeff Cortez', 1, NULL, 'Bldg. H 123 Pasong Putik, Kaligayan, Quezon City', NULL, NULL, 'Robinson', NULL, NULL, '2025-08-14 18:32:06', 'ongoing', '2025-08-14 16:32:06', 0),
+(3, 'TRPA2506AA924A2', 'Teddy Mangyan', 3, NULL, 'Taguig', NULL, NULL, 'Cavite', NULL, NULL, '2025-08-14 18:55:37', 'ongoing', '2025-08-14 16:55:37', 1),
+(4, 'TRP991593845121', 'Jennie Lopez', 4, NULL, 'MOA', 14.53518180, 120.98159940, 'PITX', 14.50847750, 120.99127120, '2025-08-15 02:53:50', 'ongoing', '2025-08-14 18:53:50', 0),
+(8, 'TRP20FC082B27D6', 'Kyle', NULL, NULL, 'SM Fairview', 14.73388760, 121.05613700, 'SM Bacoor', 14.40803830, 120.97331850, '2025-08-15 03:14:34', 'pending', '2025-08-14 19:14:34', 1),
+(9, 'TRP61EA98745489', 'Daniella', NULL, NULL, 'Bldg. L-131 Smile Citihomes 1', NULL, NULL, 'SM Bacoor Entrance', NULL, NULL, '2025-08-15 03:19:15', 'pending', '2025-08-14 19:19:15', 0),
+(10, 'TRP7444D3FEDB12', 'Kervin', NULL, NULL, 'Bldg. L-131 Smile Citihomes 1', NULL, NULL, 'SM Bacoor Entrance', NULL, NULL, '2025-08-15 03:21:11', 'pending', '2025-08-14 19:21:11', 1);
 
 -- --------------------------------------------------------
 
@@ -199,18 +216,19 @@ CREATE TABLE `users` (
   `email` varchar(255) NOT NULL,
   `password` varchar(255) NOT NULL,
   `otp` varchar(6) DEFAULT NULL,
-  `otp_expiry` datetime DEFAULT NULL
+  `otp_expiry` datetime DEFAULT NULL,
+  `role` varchar(50) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 --
 -- Dumping data for table `users`
 --
 
-INSERT INTO `users` (`id`, `username`, `email`, `password`, `otp`, `otp_expiry`) VALUES
-(1, 'admin1', 'pyketyson42@gmail.com', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', NULL, NULL),
-(2, 'dispatcher', 'dispatcher718@gmail.com', '62a39df87b501ad40b6fc145820756ccedcab952c64626968e83ccbae5beae63', NULL, NULL),
-(3, 'fleetstaff', 'viahaledriver@gmail.com', '62a39df87b501ad40b6fc145820756ccedcab952c64626968e83ccbae5beae63', NULL, NULL),
-(4, 'storeclerk', 'kioshikeshin@gmail.com', '62a39df87b501ad40b6fc145820756ccedcab952c64626968e83ccbae5beae63', NULL, NULL);
+INSERT INTO `users` (`id`, `username`, `email`, `password`, `otp`, `otp_expiry`, `role`) VALUES
+(1, 'admin1', 'pyketyson42@gmail.com', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', NULL, NULL, 'admin1'),
+(2, 'dispatcher', 'dispatcher718@gmail.com', '62a39df87b501ad40b6fc145820756ccedcab952c64626968e83ccbae5beae63', NULL, NULL, 'dispatcher'),
+(3, 'fleetstaff', 'viahaledriver@gmail.com', '62a39df87b501ad40b6fc145820756ccedcab952c64626968e83ccbae5beae63', NULL, NULL, 'fleetstaff'),
+(4, 'storeclerk', 'kioshikeshin@gmail.com', '62a39df87b501ad40b6fc145820756ccedcab952c64626968e83ccbae5beae63', NULL, NULL, 'storeclerk');
 
 -- --------------------------------------------------------
 
@@ -242,7 +260,8 @@ INSERT INTO `vehicles` (`id`, `plate_no`, `model`, `status`, `make_year`) VALUES
 -- Indexes for table `drivers`
 --
 ALTER TABLE `drivers`
-  ADD PRIMARY KEY (`id`);
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_drivers_location` (`current_location_lat`,`current_location_lng`);
 
 --
 -- Indexes for table `issued_items`
@@ -285,7 +304,8 @@ ALTER TABLE `trips`
   ADD PRIMARY KEY (`id`),
   ADD UNIQUE KEY `trip_code` (`trip_code`),
   ADD KEY `driver_id` (`driver_id`),
-  ADD KEY `vehicle_id` (`vehicle_id`);
+  ADD KEY `vehicle_id` (`vehicle_id`),
+  ADD KEY `idx_trips_priority` (`priority`);
 
 --
 -- Indexes for table `users`
@@ -309,7 +329,7 @@ ALTER TABLE `vehicles`
 -- AUTO_INCREMENT for table `drivers`
 --
 ALTER TABLE `drivers`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=3;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=5;
 
 --
 -- AUTO_INCREMENT for table `issued_items`
@@ -345,7 +365,7 @@ ALTER TABLE `supplies`
 -- AUTO_INCREMENT for table `trips`
 --
 ALTER TABLE `trips`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=2;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=11;
 
 --
 -- AUTO_INCREMENT for table `users`
