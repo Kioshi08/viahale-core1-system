@@ -1,6 +1,10 @@
-"/vendor/" 
-"db.php" 
-".env" 
-"*.log" 
-".vscode/" 
-"*.swp" 
+# Dependencies
+node_modules/
+realtime-server/node_modules/
+
+# Environment files
+.env
+
+# System
+.DS_Store
+Thumbs.db
