@@ -1,3 +1,6 @@
+# Composer dependencies
+/vendor/
+
 # Dependencies
 node_modules/
 realtime-server/node_modules/
