@@ -1,6 +1,6 @@
 <?php
-// dispatcher_dashboard.php — Fully functional ViaHale dispatcher (Leaflet + Socket.IO + Nominatim)
-// Single-file deployment: Backend endpoints + Frontend UI (ViaHale styling) in one file.
+// dispatcher_dashboard.php — ViaHale Dispatcher (Enhanced Single-File)
+// Adds: customer_contact, trip_assignments logging, reassign flow, complete/cancel, comms autofill.
 
 // ========== CONFIG ==========
 session_start();
@@ -46,7 +46,6 @@ if (!$allowed) { http_response_code(403); echo 'Access denied'; exit; }
 
 // ========== UTILITIES ==========
 function notify_socket($type, $socketUrl) {
-    // fire-and-forget to Socket.IO HTTP endpoint created earlier (server.js)
     $url = rtrim($socketUrl, '/') . '/update?type=' . urlencode($type);
     $ctx = stream_context_create(['http' => ['method' => 'GET', 'timeout' => 0.5]]);
     @file_get_contents($url, false, $ctx);
@@ -71,6 +70,22 @@ function geocode_address($address, $email){
     return ['lat' => (float)$arr[0]['lat'], 'lng' => (float)$arr[0]['lon'], 'display_name' => $arr[0]['display_name'] ?? ''];
 }
 
+// Ensure columns exist (idempotent safety)
+try { $pdo->exec("ALTER TABLE trips ADD COLUMN customer_contact VARCHAR(50) NULL AFTER passenger_name"); } catch(Exception $e) {}
+try { 
+    $pdo->exec("CREATE TABLE IF NOT EXISTS trip_assignments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        trip_id INT NOT NULL,
+        driver_id INT NOT NULL,
+        assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status ENUM('assigned','reassigned','cancelled') DEFAULT 'assigned',
+        FOREIGN KEY (trip_id) REFERENCES trips(id) ON DELETE CASCADE,
+        FOREIGN KEY (driver_id) REFERENCES drivers(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+} catch(Exception $e) {}
+try { $pdo->exec("CREATE INDEX idx_drivers_status ON drivers(status)"); } catch(Exception $e) {}
+try { $pdo->exec("CREATE INDEX idx_driver_location ON drivers(current_location_lat, current_location_lng)"); } catch(Exception $e) {}
+
 // ========== AJAX endpoints ==========
 $action = $_GET['action'] ?? null;
 if ($action) header('Content-Type: application/json; charset=utf-8');
@@ -87,7 +102,10 @@ if ($action === 'getDrivers') {
 }
 
 if ($action === 'getTrips') {
-    $stmt = $pdo->query("SELECT t.*, d.name AS driver_name, d.phone AS driver_phone FROM trips t LEFT JOIN drivers d ON d.id = t.driver_id ORDER BY t.priority DESC, t.created_at ASC");
+    $stmt = $pdo->query("SELECT t.*, d.name AS driver_name, d.phone AS driver_phone 
+                         FROM trips t 
+                         LEFT JOIN drivers d ON d.id = t.driver_id 
+                         ORDER BY t.priority DESC, t.created_at ASC");
     $trips = $stmt->fetchAll(PDO::FETCH_ASSOC);
     echo json_encode(['trips'=>$trips]); exit;
 }
@@ -96,40 +114,37 @@ if ($action === 'getTrips') {
 if ($action === 'createTrip' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $b = json_decode(file_get_contents('php://input'), true) ?: [];
     $passenger = trim($b['passenger_name'] ?? 'Passenger');
+    $customer_contact = trim($b['customer_contact'] ?? '');
     $origin = trim($b['origin'] ?? '');
     $destination = trim($b['destination'] ?? '');
     $priority = (int)($b['priority'] ?? 0);
     if (!$origin || !$destination) { echo json_encode(['error'=>'origin and destination required']); exit; }
 
-    // geocode origin/destination
     $geoO = geocode_address($origin, $NOMINATIM_EMAIL);
-    usleep(200000); // small gap
+    usleep(200000);
     $geoD = geocode_address($destination, $NOMINATIM_EMAIL);
 
     $trip_code = 'TRP'.strtoupper(substr(md5(uniqid('', true)), 0, 12));
-    // try to insert with geo columns (migration assumed), fallback if not possible
     try {
-        $sql = "INSERT INTO trips (trip_code, passenger_name, origin, destination, scheduled_time, priority, status, created_at, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng)
-                VALUES (:tc,:pn,:o,:d, NOW(), :p, 'pending', NOW(), :plat, :plng, :dlat, :dlng)";
+        $sql = "INSERT INTO trips (trip_code, passenger_name, customer_contact, origin, destination, scheduled_time, priority, status, created_at, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng)
+                VALUES (:tc,:pn,:cc,:o,:d, NOW(), :p, 'pending', NOW(), :plat, :plng, :dlat, :dlng)";
         $st = $pdo->prepare($sql);
         $st->execute([
-            'tc'=>$trip_code,'pn'=>$passenger,'o'=>$origin,'d'=>$destination,'p'=>$priority,
+            'tc'=>$trip_code,'pn'=>$passenger,'cc'=>$customer_contact,'o'=>$origin,'d'=>$destination,'p'=>$priority,
             'plat'=>$geoO['lat']??null,'plng'=>$geoO['lng']??null,'dlat'=>$geoD['lat']??null,'dlng'=>$geoD['lng']??null
         ]);
         $trip_id = $pdo->lastInsertId();
     } catch (Exception $e) {
-        // fallback insert without geo
-        $st = $pdo->prepare("INSERT INTO trips (trip_code, passenger_name, origin, destination, scheduled_time, priority, status, created_at) VALUES (:tc,:pn,:o,:d, NOW(), :p, 'pending', NOW())");
-        $st->execute(['tc'=>$trip_code,'pn'=>$passenger,'o'=>$origin,'d'=>$destination,'p'=>$priority]);
+        $st = $pdo->prepare("INSERT INTO trips (trip_code, passenger_name, customer_contact, origin, destination, scheduled_time, priority, status, created_at) VALUES (:tc,:pn,:cc,:o,:d, NOW(), :p, 'pending', NOW())");
+        $st->execute(['tc'=>$trip_code,'pn'=>$passenger,'cc'=>$customer_contact,'o'=>$origin,'d'=>$destination,'p'=>$priority]);
         $trip_id = $pdo->lastInsertId();
     }
 
-    // notify socket for real-time update
     notify_socket('trips', $SOCKET_IO_URL);
     echo json_encode(['success'=>true,'trip_code'=>$trip_code,'trip_id'=>$trip_id,'pickup'=>$geoO,'dropoff'=>$geoD]); exit;
 }
 
-// Suggest driver (same algorithm as previous)
+// Suggest driver (smart)
 if ($action === 'suggestDriver' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $b = json_decode(file_get_contents('php://input'), true) ?: [];
     $plat = (float)($b['pickup_lat'] ?? 0);
@@ -156,26 +171,31 @@ if ($action === 'suggestDriver' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     echo json_encode(['candidates'=>$cands]); exit;
 }
 
-// Assign driver (transaction)
+// Assign driver (transaction + conflict + trip_assignments + optional reassign)
 if ($action === 'assignDriver' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $b = json_decode(file_get_contents('php://input'), true) ?: [];
     $trip_id = (int)($b['trip_id'] ?? 0);
     $driver_id = (int)($b['driver_id'] ?? 0);
     if (!$trip_id || !$driver_id) { echo json_encode(['error'=>'trip_id & driver_id required']); exit; }
 
-    // check driver exists and available
+    // driver validation
     $st = $pdo->prepare("SELECT id,status,shift_end_time FROM drivers WHERE id=:id LIMIT 1");
     $st->execute(['id'=>$driver_id]);
     $driver = $st->fetch(PDO::FETCH_ASSOC);
     if (!$driver) { echo json_encode(['error'=>'Driver not found']); exit; }
     if ($driver['status'] !== 'available') { echo json_encode(['error'=>'Driver not available']); exit; }
 
-    // conflict check
+    // conflict check: active trip
     $chk = $pdo->prepare("SELECT COUNT(*) FROM trips WHERE driver_id=:d AND status='ongoing'");
     $chk->execute(['d'=>$driver_id]);
     if ($chk->fetchColumn() > 0) { echo json_encode(['error'=>'Driver already has an ongoing trip']); exit; }
 
-    // shift warning
+    // fetch trip to detect reassign
+    $tq = $pdo->prepare("SELECT id, driver_id, status FROM trips WHERE id=:t LIMIT 1");
+    $tq->execute(['t'=>$trip_id]);
+    $trip = $tq->fetch(PDO::FETCH_ASSOC);
+    if (!$trip) { echo json_encode(['error'=>'Trip not found']); exit; }
+
     $warning = null;
     if (!empty($driver['shift_end_time'])) {
         $shift_ts = strtotime(date('Y-m-d') . ' ' . $driver['shift_end_time']);
@@ -184,10 +204,25 @@ if ($action === 'assignDriver' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
     try {
         $pdo->beginTransaction();
-        $u1 = $pdo->prepare("UPDATE trips SET driver_id = :d, status = 'ongoing' WHERE id = :t");
-        $u1->execute(['d'=>$driver_id,'t'=>$trip_id]);
-        $u2 = $pdo->prepare("UPDATE drivers SET status = 'on_trip' WHERE id = :d");
-        $u2->execute(['d'=>$driver_id]);
+
+        // If trip already had a driver, release them and mark trip_assignments reassign log
+        if (!empty($trip['driver_id']) && (int)$trip['driver_id'] !== $driver_id) {
+            $prev = (int)$trip['driver_id'];
+            $pdo->prepare("UPDATE drivers SET status='available' WHERE id=:id")->execute(['id'=>$prev]);
+            $pdo->prepare("INSERT INTO trip_assignments (trip_id, driver_id, status) VALUES (:t,:d,'reassigned')")
+                ->execute(['t'=>$trip_id,'d'=>$prev]);
+        }
+
+        // Assign new driver
+        $pdo->prepare("UPDATE trips SET driver_id = :d, status = 'ongoing' WHERE id = :t")
+            ->execute(['d'=>$driver_id,'t'=>$trip_id]);
+        $pdo->prepare("UPDATE drivers SET status = 'on_trip' WHERE id = :d")
+            ->execute(['d'=>$driver_id]);
+
+        // Log assignment
+        $pdo->prepare("INSERT INTO trip_assignments (trip_id, driver_id, status) VALUES (:t,:d,'assigned')")
+            ->execute(['t'=>$trip_id,'d'=>$driver_id]);
+
         $pdo->commit();
     } catch (Exception $e) {
         $pdo->rollBack();
@@ -199,7 +234,7 @@ if ($action === 'assignDriver' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     echo json_encode(['success'=>true,'warning'=>$warning]); exit;
 }
 
-// Update driver location (for mobile simulation)
+// Update driver location (mobile simulation)
 if ($action === 'updateDriverLocation' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $b = json_decode(file_get_contents('php://input'), true) ?: [];
     $driver_id = (int)($b['driver_id'] ?? 0);
@@ -211,9 +246,60 @@ if ($action === 'updateDriverLocation' && $_SERVER['REQUEST_METHOD'] === 'POST')
     echo json_encode(['success'=>true]); exit;
 }
 
-// SMS stub
+// Trip status: complete/cancel (frees driver)
+if ($action === 'updateTripStatus' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $b = json_decode(file_get_contents('php://input'), true) ?: [];
+    $trip_id = (int)($b['trip_id'] ?? 0);
+    $new_status = $b['status'] ?? '';
+    if (!$trip_id || !in_array($new_status, ['completed','cancelled','pending','ongoing'], true)) {
+        echo json_encode(['error'=>'trip_id and valid status required']); exit;
+    }
+
+    // fetch current trip
+    $st = $pdo->prepare("SELECT id, driver_id, status FROM trips WHERE id=:t LIMIT 1");
+    $st->execute(['t'=>$trip_id]);
+    $trip = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$trip) { echo json_encode(['error'=>'Trip not found']); exit; }
+
+    try {
+        $pdo->beginTransaction();
+
+        // update trip
+        $pdo->prepare("UPDATE trips SET status=:s WHERE id=:t")->execute(['s'=>$new_status,'t'=>$trip_id]);
+
+        // if completed/cancelled, free driver
+        if (in_array($new_status, ['completed','cancelled'], true) && !empty($trip['driver_id'])) {
+            $pdo->prepare("UPDATE drivers SET status='available' WHERE id=:d")->execute(['d'=>$trip['driver_id']]);
+            if ($new_status === 'cancelled') {
+                $pdo->prepare("INSERT INTO trip_assignments (trip_id, driver_id, status) VALUES (:t,:d,'cancelled')")
+                    ->execute(['t'=>$trip_id, 'd'=>$trip['driver_id']]);
+            }
+        }
+
+        $pdo->commit();
+    } catch(Exception $e) {
+        $pdo->rollBack();
+        echo json_encode(['error'=>'DB error: '.$e->getMessage()]); exit;
+    }
+
+    notify_socket('trips', $SOCKET_IO_URL);
+    notify_socket('drivers', $SOCKET_IO_URL);
+    echo json_encode(['success'=>true]); exit;
+}
+
+// SMS stub (now supports trip autofill)
 if ($action === 'sendSMS' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    echo json_encode(['success'=>true,'note'=>'SMS endpoint is stubbed. Integrate Twilio to send real SMS.']); exit;
+    $b = json_decode(file_get_contents('php://input'), true) ?: [];
+    $to = trim($b['to'] ?? '');
+    $trip_id = isset($b['trip_id']) ? (int)$b['trip_id'] : 0;
+    $message = $b['message'] ?? '';
+    if (!$to && $trip_id) {
+        $q = $pdo->prepare("SELECT customer_contact FROM trips WHERE id=:t");
+        $q->execute(['t'=>$trip_id]);
+        $to = (string)$q->fetchColumn();
+    }
+    if (!$to) { echo json_encode(['error'=>'No phone provided']); exit; }
+    echo json_encode(['success'=>true,'note'=>'SMS endpoint is stubbed. Integrate Twilio to send real SMS.','to'=>$to,'message'=>$message]); exit;
 }
 
 // No action: serve the HTML/JS UI
@@ -222,7 +308,7 @@ if ($action === 'sendSMS' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>ViaHale Dispatcher — Realtime</title>
+<title>ViaHale — Dispatcher</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&family=Quicksand:wght@500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
@@ -240,7 +326,7 @@ body{margin:0;font-family:var(--font-b);background:#f7f7fb;color:#111}
 .brand{display:flex;align-items:center;gap:12px}
 .brand h1{font-family:var(--font-h);font-size:18px;margin:0}
 #wrap{display:flex;height:calc(100vh - 64px)}
-#sidebar{width:420px;background:white;border-right:1px solid #e6e6f0;padding:18px;overflow:auto}
+#sidebar{width:440px;background:white;border-right:1px solid #e6e6f0;padding:18px;overflow:auto}
 #map{flex:1}
 .section{margin-bottom:14px}
 .btn{background:var(--vh-primary);color:white;padding:8px 12px;border-radius:12px;border:none;cursor:pointer;box-shadow:0 6px 14px rgba(101,50,201,0.12)}
@@ -253,35 +339,23 @@ label{font-size:13px;color:#333;margin-bottom:6px;display:block}
 .priority{background:linear-gradient(90deg,#fff7e6,#fff8f0);border-left:4px solid #ffb74d}
 .driver-item{padding:8px;border-radius:10px;border:1px solid #f0eef8;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 .modal-backdrop{position:fixed;inset:0;background:rgba(12,10,30,0.45);display:none;align-items:center;justify-content:center;z-index:999}
-.modal{background:white;border-radius:14px;padding:18px;width:520px;max-width:96%;box-shadow:0 18px 40px rgba(67,17,165,0.12);transform:translateY(-8px);opacity:0;transition:all .18s ease}
+.modal{background:white;border-radius:14px;padding:18px;width:560px;max-width:96%;box-shadow:0 18px 40px rgba(67,17,165,0.12);transform:translateY(-8px);opacity:0;transition:all .18s ease}
 .modal.show{transform:none;opacity:1}
 .modal .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .modal .modal-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
 .tag{display:inline-block;padding:6px 8px;border-radius:999px;background:#f3f0ff;color:var(--vh-dark);font-size:13px}
 @media (max-width:900px){ #sidebar{width:360px} }
-.vih-logout-btn {
-    background-color: #6532C9; /* ViaHale Purple */
-    color: white;
-    border: none;
-    padding: 6px 14px;
-    font-size: 13px;
-    font-family: 'Poppins', sans-serif;
-    border-radius: 10px;
-    cursor: pointer;
-    transition: background 0.3s ease, transform 0.2s ease;
-}
-.vih-logout-btn:hover {
-    background-color: #4311A5; /* Darker purple on hover */
-    transform: scale(1.05);
-}
+.vih-logout-btn{background-color:#6532C9;color:white;border:none;padding:6px 14px;font-size:13px;font-family:'Poppins',sans-serif;border-radius:10px;cursor:pointer;transition:background .3s ease, transform .2s ease}
+.vih-logout-btn:hover{background-color:#4311A5;transform:scale(1.05)}
+.small{font-size:12px;color:#666}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid #e7e3ff}
+.badge-prio{background:#fff5e6}
 </style>
 </head>
 <body>
 <div class="topbar">
   <div class="brand">
-    <img src="../logo.png" 
-         alt="ViaHale Logo" 
-         style="height:40px;width:auto;display:block;"> 
+    <img src="../logo.png" alt="ViaHale Logo" style="height:40px;width:auto;display:block;">
     <div>
       <h1>ViaHale Dispatcher</h1>
       <div style="font-size:13px;opacity:0.9">Realtime dispatch console</div>
@@ -299,13 +373,13 @@ label{font-size:13px;color:#333;margin-bottom:6px;display:block}
     <div class="section card" style="display:flex;justify-content:space-between;align-items:center">
       <div>
         <div class="tag">Live Map</div>
-        <div style="font-size:13px;color:#666;margin-top:6px">Drivers & Trips update instantly</div>
+        <div class="small" style="margin-top:6px">Drivers & Trips update instantly</div>
       </div>
       <div><button class="btn ghost" id="refreshBtn">Refresh</button></div>
     </div>
 
     <div class="section">
-      <h3 style="margin:6px 0 10px 0">Trips (Priority first)</h3>
+      <h3 style="margin:6px 0 10px 0">Trips <span class="badge badge-prio">Priority first</span></h3>
       <div id="tripsList"></div>
     </div>
 
@@ -323,25 +397,29 @@ label{font-size:13px;color:#333;margin-bottom:6px;display:block}
       <div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end">
         <button class="btn ghost" id="smsBtn">Send (stub)</button>
       </div>
-      <div id="smsResult" style="margin-top:8px;color:#666;font-size:13px"></div>
+      <div id="smsResult" class="small" style="margin-top:8px"></div>
     </div>
   </div>
 
   <div id="map" style="height:calc(100vh - 64px)"></div>
 </div>
 
+<!-- Modals -->
 <div id="modalBackdrop" class="modal-backdrop">
+  <!-- New Trip -->
   <div id="newTripModal" class="modal" role="dialog" aria-modal="true" style="display:none">
     <div class="modal-header">
       <div>
         <strong style="font-family:var(--font-h)">Create New Trip</strong>
-        <div style="font-size:13px;color:#666">Add pickup & dropoff and mark priority</div>
+        <div class="small">Add pickup & dropoff and mark priority</div>
       </div>
       <button class="btn ghost" onclick="closeModal('newTripModal')">Close</button>
     </div>
     <div>
       <label>Passenger name</label>
       <input id="nt_passenger" placeholder="Passenger name">
+      <label style="margin-top:8px">Customer phone</label>
+      <input id="nt_contact" placeholder="09xxxxxxxxx">
       <label style="margin-top:8px">Origin address</label>
       <input id="nt_origin" placeholder="Address, city">
       <label style="margin-top:8px">Destination address</label>
@@ -354,11 +432,12 @@ label{font-size:13px;color:#333;margin-bottom:6px;display:block}
     </div>
   </div>
 
+  <!-- Assign -->
   <div id="assignModal" class="modal" role="dialog" aria-modal="true" style="display:none">
     <div class="modal-header">
       <div>
         <strong style="font-family:var(--font-h)">Assign Driver</strong>
-        <div id="assignTripLabel" style="font-size:13px;color:#666">Trip: —</div>
+        <div id="assignTripLabel" class="small">Trip: —</div>
       </div>
       <button class="btn ghost" onclick="closeModal('assignModal')">Close</button>
     </div>
@@ -369,11 +448,11 @@ label{font-size:13px;color:#333;margin-bottom:6px;display:block}
       </div>
       <div style="display:flex;gap:10px">
         <div style="flex:1">
-          <div style="font-size:13px;color:#666">Suggested</div>
+          <div class="small">Suggested</div>
           <div id="suggestedDriverBox" style="margin-top:8px"></div>
         </div>
         <div style="flex:1">
-          <div style="font-size:13px;color:#666">All Available</div>
+          <div class="small">All Available</div>
           <div id="allDriversBox" style="margin-top:8px;max-height:220px;overflow:auto"></div>
         </div>
       </div>
@@ -390,7 +469,6 @@ label{font-size:13px;color:#333;margin-bottom:6px;display:block}
 <script>
 const API = 'dispatcher_dashboard.php';
 const SOCKET_IO_URL = <?php echo json_encode($SOCKET_IO_URL); ?>;
-const NOMINATIM_EMAIL = <?php echo json_encode($NOMINATIM_EMAIL); ?>;
 const PRIMARY = <?php echo json_encode($V_PRIMARY); ?>;
 let map = L.map('map').setView([14.5995,120.9842], 12);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
@@ -406,7 +484,7 @@ async function apiPost(action, data){ const r = await fetch(`${API}?action=${act
 /* Socket.IO real-time updates */
 const socket = io(SOCKET_IO_URL, { transports:['websocket','polling'] });
 socket.on('connect', ()=> console.log('socket connected'));
-socket.on('updateData', (msg) => { refreshAll(); });
+socket.on('updateData', (_) => { refreshAll(); });
 
 /* Modal helpers */
 function showModal(id){ document.getElementById('modalBackdrop').style.display='flex'; const m=document.getElementById(id); m.style.display='block'; setTimeout(()=>m.classList.add('show'),10); }
@@ -414,187 +492,236 @@ function closeModal(id){ const m=document.getElementById(id); m.classList.remove
 
 /* Render drivers & trips */
 function clearMarkers(dict){ for(const k in dict){ try{ map.removeLayer(dict[k]); }catch{} } }
+
 async function refreshDrivers(){
-    const res = await apiGet('getDrivers');
-    const box = document.getElementById('driversList');
-    box.innerHTML = '';
-    if(!res.drivers) return;
-    res.drivers.forEach(d=>{
-        if(d.status === 'available'){
-            const el = document.createElement('div'); el.className='driver-item';
-            el.innerHTML = `<div><strong>${escapeHtml(d.name)}</strong><div style="font-size:13px;color:#666">${escapeHtml(d.phone)} — ${d.rating_average}★</div></div>
-                <div><button class="btn ghost" data-quickassign="${d.id}">Assign</button></div>`;
-            box.appendChild(el);
-        }
-        // markers
-        if(d.current_location_lat && d.current_location_lng){
-            const key = 'd_'+d.id;
-            const color = d.status === 'available' ? PRIMARY : '#16a34a';
-            const icon = L.divIcon({ html:`<div style="width:18px;height:18px;border-radius:9px;background:${color};border:2px solid #fff"></div>`, className:'' });
-            if(driverMarkers[key]) { driverMarkers[key].setLatLng([d.current_location_lat, d.current_location_lng]); driverMarkers[key].setPopupContent(`<b>${escapeHtml(d.name)}</b><br>${escapeHtml(d.phone)}<br>Status: ${escapeHtml(d.status)}`); }
-            else { driverMarkers[key] = L.marker([d.current_location_lat, d.current_location_lng], {icon}).addTo(map).bindPopup(`<b>${escapeHtml(d.name)}</b><br>${escapeHtml(d.phone)}<br>Status: ${escapeHtml(d.status)}`); }
-        }
-    });
+  const res = await apiGet('getDrivers');
+  const box = document.getElementById('driversList');
+  box.innerHTML = '';
+  if(!res.drivers) return;
+  res.drivers.forEach(d=>{
+    if(d.status === 'available'){
+      const el = document.createElement('div'); el.className='driver-item';
+      el.innerHTML = `<div><strong>${escapeHtml(d.name)}</strong><div class="small">${escapeHtml(d.phone)} — ${d.rating_average}★</div></div>
+        <div style="display:flex;gap:6px"><button class="btn ghost" data-quickassign="${d.id}">Assign</button></div>`;
+      box.appendChild(el);
+    }
+    // markers
+    if(d.current_location_lat && d.current_location_lng){
+      const key = 'd_'+d.id;
+      const color = d.status === 'available' ? PRIMARY : '#16a34a';
+      const icon = L.divIcon({ html:`<div style="width:18px;height:18px;border-radius:9px;background:${color};border:2px solid #fff"></div>`, className:'' });
+      if(driverMarkers[key]) {
+        driverMarkers[key].setLatLng([d.current_location_lat, d.current_location_lng]);
+        driverMarkers[key].setPopupContent(`<b>${escapeHtml(d.name)}</b><br>${escapeHtml(d.phone)}<br>Status: ${escapeHtml(d.status)}`);
+      } else {
+        driverMarkers[key] = L.marker([d.current_location_lat, d.current_location_lng], {icon})
+          .addTo(map).bindPopup(`<b>${escapeHtml(d.name)}</b><br>${escapeHtml(d.phone)}<br>Status: ${escapeHtml(d.status)}`);
+      }
+    }
+  });
 }
 
 async function refreshTrips(){
-    const res = await apiGet('getTrips');
-    const box = document.getElementById('tripsList');
-    box.innerHTML = '';
-    if(!res.trips) return;
-    res.trips.forEach(t=>{
-        const div = document.createElement('div'); div.className = 'trip' + (t.priority==1 ? ' priority' : '');
-        const assignBtn = t.driver_name ? '' : `<button class="btn" data-assign="${t.id}" data-plat="${t.pickup_lat??''}" data-plng="${t.pickup_lng??''}">Assign</button>`;
-        div.innerHTML = `<div class="left"><strong>${escapeHtml(t.trip_code)}</strong><div style="font-size:13px;color:#666">${escapeHtml(t.passenger_name||'')}</div><div style="font-size:13px">${escapeHtml(t.origin||'')} → ${escapeHtml(t.destination||'')}</div></div>
-            <div style="text-align:right"><div style="font-size:13px">${escapeHtml(t.status)}${t.driver_name ? ' — '+escapeHtml(t.driver_name) : ''}</div><div style="margin-top:8px">${assignBtn}</div></div>`;
-        box.appendChild(div);
+  const res = await apiGet('getTrips');
+  const box = document.getElementById('tripsList');
+  box.innerHTML = '';
+  if(!res.trips) return;
+  res.trips.forEach(t=>{
+    const div = document.createElement('div'); div.className = 'trip' + (Number(t.priority)===1 ? ' priority' : '');
+    const assignBtn = t.driver_name ? '' : `<button class="btn" data-assign="${t.id}" data-plat="${t.pickup_lat??''}" data-plng="${t.pickup_lng??''}">Assign</button>`;
+    const msgBtn = `<button class="btn ghost" data-msg="${t.id}" data-phone="${escapeAttr(t.customer_contact||'')}">Msg</button>`;
+    const completeBtn = (t.status==='ongoing') ? `<button class="btn ghost" data-done="${t.id}">Complete</button>` : '';
+    const cancelBtn = (t.status!=='completed' && t.status!=='cancelled') ? `<button class="btn ghost" data-cancel="${t.id}">Cancel</button>` : '';
 
-        // markers
-        if(t.pickup_lat && t.pickup_lng){
-            const keyp = 't_'+t.id+'_p';
-            const lat = +t.pickup_lat, lng = +t.pickup_lng;
-            if(tripMarkers[keyp]) tripMarkers[keyp].setLatLng([lat,lng]);
-            else tripMarkers[keyp] = L.marker([lat,lng], {title:'Pickup:'+t.trip_code, icon:L.divIcon({html:`<div style="width:14px;height:14px;border-radius:7px;background:#ffb84d;border:2px solid #fff"></div>`})}).addTo(map).bindPopup(`<b>Pickup</b><br>${escapeHtml(t.origin||'')}`);
-        }
-        if(t.dropoff_lat && t.dropoff_lng){
-            const keyd = 't_'+t.id+'_d';
-            const lat = +t.dropoff_lat, lng = +t.dropoff_lng;
-            if(tripMarkers[keyd]) tripMarkers[keyd].setLatLng([lat,lng]);
-            else tripMarkers[keyd] = L.marker([lat,lng], {title:'Dropoff:'+t.trip_code, icon:L.divIcon({html:`<div style="width:14px;height:14px;border-radius:7px;background:#38bdf8;border:2px solid #fff"></div>`})}).addTo(map).bindPopup(`<b>Dropoff</b><br>${escapeHtml(t.destination||'')}`);
-        }
+    div.innerHTML = `
+      <div class="left">
+        <strong>${escapeHtml(t.trip_code)}</strong>
+        ${Number(t.priority)===1 ? ' <span class="badge badge-prio">URGENT</span>' : ''}
+        <div class="small">${escapeHtml(t.passenger_name||'')} ${t.customer_contact?` • ${escapeHtml(t.customer_contact)}`:''}</div>
+        <div>${escapeHtml(t.origin||'')} → ${escapeHtml(t.destination||'')}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="small">${escapeHtml(t.status)}${t.driver_name ? ' — '+escapeHtml(t.driver_name) : ''}</div>
+        <div style="margin-top:6px;display:flex;gap:6px;justify-content:flex-end">${assignBtn}${msgBtn}${completeBtn}${cancelBtn}</div>
+      </div>`;
+    box.appendChild(div);
+
+    // markers
+    if(t.pickup_lat && t.pickup_lng){
+      const keyp = 't_'+t.id+'_p';
+      const lat = +t.pickup_lat, lng = +t.pickup_lng;
+      if(tripMarkers[keyp]) tripMarkers[keyp].setLatLng([lat,lng]);
+      else tripMarkers[keyp] = L.marker([lat,lng], {title:'Pickup:'+t.trip_code, icon:L.divIcon({html:`<div style="width:14px;height:14px;border-radius:7px;background:#ffb84d;border:2px solid #fff"></div>`})}).addTo(map).bindPopup(`<b>Pickup</b><br>${escapeHtml(t.origin||'')}`);
+    }
+    if(t.dropoff_lat && t.dropoff_lng){
+      const keyd = 't_'+t.id+'_d';
+      const lat = +t.dropoff_lat, lng = +t.dropoff_lng;
+      if(tripMarkers[keyd]) tripMarkers[keyd].setLatLng([lat,lng]);
+      else tripMarkers[keyd] = L.marker([lat,lng], {title:'Dropoff:'+t.trip_code, icon:L.divIcon({html:`<div style="width:14px;height:14px;border-radius:7px;background:#38bdf8;border:2px solid #fff"></div>`})}).addTo(map).bindPopup(`<b>Dropoff</b><br>${escapeHtml(t.destination||'')}`);
+    }
+  });
+
+  // bind actions
+  document.querySelectorAll('[data-assign]').forEach(btn=>{
+    btn.removeEventListener('click', assignBtnHandler);
+    btn.addEventListener('click', assignBtnHandler);
+  });
+  document.querySelectorAll('[data-quickassign]').forEach(btn=>{
+    btn.removeEventListener('click', quickAssignHandler);
+    btn.addEventListener('click', quickAssignHandler);
+  });
+  document.querySelectorAll('[data-msg]').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{
+      const phone = e.currentTarget.getAttribute('data-phone') || '';
+      document.getElementById('sms_to').value = phone;
+      document.getElementById('sms_msg').value = '';
+      document.getElementById('sms_to').focus();
     });
-    // attach event listeners to assign & quick assign buttons (delegation)
-    document.querySelectorAll('[data-assign]').forEach(btn=>{
-        btn.removeEventListener('click', assignBtnHandler);
-        btn.addEventListener('click', assignBtnHandler);
+  });
+  document.querySelectorAll('[data-done]').forEach(btn=>{
+    btn.addEventListener('click', async (e)=>{
+      const id = parseInt(e.currentTarget.getAttribute('data-done'));
+      if(!confirm('Mark trip as completed?')) return;
+      const r = await apiPost('updateTripStatus', { trip_id:id, status:'completed' });
+      if(r.error) alert('Error: '+r.error); else refreshAll();
     });
-    document.querySelectorAll('[data-quickassign]').forEach(btn=>{
-        btn.removeEventListener('click', quickAssignHandler);
-        btn.addEventListener('click', quickAssignHandler);
+  });
+  document.querySelectorAll('[data-cancel]').forEach(btn=>{
+    btn.addEventListener('click', async (e)=>{
+      const id = parseInt(e.currentTarget.getAttribute('data-cancel'));
+      if(!confirm('Cancel this trip?')) return;
+      const r = await apiPost('updateTripStatus', { trip_id:id, status:'cancelled' });
+      if(r.error) alert('Error: '+r.error); else refreshAll();
     });
+  });
 }
 
 function assignBtnHandler(e){
-    const btn = e.currentTarget;
-    const tripId = parseInt(btn.getAttribute('data-assign'));
-    const plat = btn.getAttribute('data-plat') || null;
-    const plng = btn.getAttribute('data-plng') || null;
-    openAssign(tripId, plat ? Number(plat) : null, plng ? Number(plng) : null);
+  const btn = e.currentTarget;
+  const tripId = parseInt(btn.getAttribute('data-assign'));
+  const plat = btn.getAttribute('data-plat') || null;
+  const plng = btn.getAttribute('data-plng') || null;
+  openAssign(tripId, plat ? Number(plat) : null, plng ? Number(plng) : null);
 }
+
 function quickAssignHandler(e){
-    const btn = e.currentTarget;
-    const driverId = parseInt(btn.getAttribute('data-quickassign'));
-    const tid = prompt('Enter Trip ID to assign this driver to (copy from trip list):');
-    if(!tid) return;
-    assign_context.selected_driver_id = driverId;
-    assign_context.trip_id = parseInt(tid);
-    document.getElementById('assignConfirmBtn').click();
+  const btn = e.currentTarget;
+  const driverId = parseInt(btn.getAttribute('data-quickassign'));
+  const tid = prompt('Enter Trip ID to assign this driver to (copy from trip list):');
+  if(!tid) return;
+  assign_context.selected_driver_id = driverId;
+  assign_context.trip_id = parseInt(tid);
+  document.getElementById('assignConfirmBtn').click();
 }
 
 /* Refresh all */
 async function refreshAll(){ await Promise.all([refreshDrivers(), refreshTrips()]); }
 
-/* Escape helper */
+/* Helpers */
 function escapeHtml(s){ if (s===null||s===undefined) return ''; return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function escapeAttr(s){ return String(s||'').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
 
 /* New Trip flow */
-document.getElementById('newTripBtn').addEventListener('click', ()=>{ document.getElementById('nt_passenger').value=''; document.getElementById('nt_origin').value=''; document.getElementById('nt_destination').value=''; document.getElementById('nt_priority').checked=false; showModal('newTripModal'); });
+document.getElementById('newTripBtn').addEventListener('click', ()=>{
+  document.getElementById('nt_passenger').value='';
+  document.getElementById('nt_contact').value='';
+  document.getElementById('nt_origin').value='';
+  document.getElementById('nt_destination').value='';
+  document.getElementById('nt_priority').checked=false;
+  showModal('newTripModal');
+});
 document.getElementById('createTripConfirm').addEventListener('click', async ()=>{
-    const passenger = document.getElementById('nt_passenger').value || 'Passenger';
-    const origin = document.getElementById('nt_origin').value.trim();
-    const destination = document.getElementById('nt_destination').value.trim();
-    const priority = document.getElementById('nt_priority').checked ? 1 : 0;
-    if(!origin || !destination) return alert('Please enter origin and destination.');
-    const res = await apiPost('createTrip', { passenger_name: passenger, origin, destination, priority });
-    if(res.error) return alert('Error: '+res.error);
-    if(res.success){
-        closeModal('newTripModal');
-        await refreshAll();
-        // auto-zoom to pickup if provided
-        if(res.pickup && res.pickup.lat && res.pickup.lng){
-            map.flyTo([res.pickup.lat, res.pickup.lng], 15, {duration:1.2});
-        }
-        alert('Trip created: '+res.trip_code);
-    } else alert('Unexpected create response');
+  const passenger = document.getElementById('nt_passenger').value || 'Passenger';
+  const contact = document.getElementById('nt_contact').value.trim();
+  const origin = document.getElementById('nt_origin').value.trim();
+  const destination = document.getElementById('nt_destination').value.trim();
+  const priority = document.getElementById('nt_priority').checked ? 1 : 0;
+  if(!origin || !destination) return alert('Please enter origin and destination.');
+  const res = await apiPost('createTrip', { passenger_name: passenger, customer_contact: contact, origin, destination, priority });
+  if(res.error) return alert('Error: '+res.error);
+  if(res.success){
+    closeModal('newTripModal');
+    await refreshAll();
+    if(res.pickup && res.pickup.lat && res.pickup.lng){ map.flyTo([res.pickup.lat, res.pickup.lng], 15, {duration:1.2}); }
+    alert('Trip created: '+res.trip_code);
+  } else alert('Unexpected create response');
 });
 
 /* Assign flow */
 async function openAssign(tripId, plat=null, plng=null){
-    assign_context.trip_id = tripId; assign_context.pickup_lat = plat; assign_context.pickup_lng = plng; assign_context.selected_driver_id = null;
-    document.getElementById('assignTripLabel').innerText = 'Trip: ' + tripId;
-    document.getElementById('assign_search').value = '';
-    document.getElementById('suggestedDriverBox').innerHTML = 'Loading...';
-    document.getElementById('allDriversBox').innerHTML = 'Loading...';
-    showModal('assignModal');
-    // suggested
-    if(assign_context.pickup_lat && assign_context.pickup_lng){
-        const sres = await apiPost('suggestDriver', { pickup_lat: assign_context.pickup_lat, pickup_lng: assign_context.pickup_lng });
-        renderSuggested(sres.candidates || []);
-    } else {
-        document.getElementById('suggestedDriverBox').innerHTML = '<div style="color:#666;font-size:13px">No pickup coordinates available.</div>';
-    }
-    // all available
-    const dres = await apiGet('getDrivers');
-    renderAllDrivers(dres.drivers || []);
+  assign_context.trip_id = tripId; assign_context.pickup_lat = plat; assign_context.pickup_lng = plng; assign_context.selected_driver_id = null;
+  document.getElementById('assignTripLabel').innerText = 'Trip: ' + tripId;
+  document.getElementById('assign_search').value = '';
+  document.getElementById('suggestedDriverBox').innerHTML = 'Loading...';
+  document.getElementById('allDriversBox').innerHTML = 'Loading...';
+  showModal('assignModal');
+  // suggested
+  if(assign_context.pickup_lat && assign_context.pickup_lng){
+    const sres = await apiPost('suggestDriver', { pickup_lat: assign_context.pickup_lat, pickup_lng: assign_context.pickup_lng });
+    renderSuggested(sres.candidates || []);
+  } else {
+    document.getElementById('suggestedDriverBox').innerHTML = '<div class="small">No pickup coordinates available.</div>';
+  }
+  // all available
+  const dres = await apiGet('getDrivers');
+  renderAllDrivers(dres.drivers || []);
 }
 
 function renderSuggested(candidates){
-    const box = document.getElementById('suggestedDriverBox'); box.innerHTML = '';
-    if(!candidates || candidates.length === 0){ box.innerHTML = '<div style="color:#666;font-size:13px">No suggestions</div>'; return; }
-    const first = candidates[0];
-    const d = first.driver;
-    const el = document.createElement('div'); el.className = 'driver-item';
-    el.innerHTML = `<div><strong>${escapeHtml(d.name)}</strong><div style="font-size:13px;color:#666">${escapeHtml(d.phone)} — ${first.distance_km} km — est ${first.est_min} min ${first.shift_ok ? '' : '<span style="color:#b36b00">(shift close)</span>'}</div></div>
-        <div><button class="btn" data-select="${d.id}">Select</button></div>`;
-    box.appendChild(el);
-    assign_context.selected_driver_id = d.id;
-    // other candidates
-    candidates.slice(1).forEach(c=>{
-        const dd=c.driver;
-        const x = document.createElement('div'); x.className='driver-item';
-        x.innerHTML = `<div><strong>${escapeHtml(dd.name)}</strong><div style="font-size:13px;color:#666">${escapeHtml(dd.phone)} — ${c.distance_km} km</div></div><div><button class="btn ghost" data-select="${dd.id}">Select</button></div>`;
-        box.appendChild(x);
-    });
-    // bind select buttons
-    box.querySelectorAll('[data-select]').forEach(b=>{ b.removeEventListener('click', selectDriverHandler); b.addEventListener('click', selectDriverHandler); });
+  const box = document.getElementById('suggestedDriverBox'); box.innerHTML = '';
+  if(!candidates || candidates.length === 0){ box.innerHTML = '<div class="small">No suggestions</div>'; return; }
+  const first = candidates[0];
+  const d = first.driver;
+  const el = document.createElement('div'); el.className = 'driver-item';
+  el.innerHTML = `<div><strong>${escapeHtml(d.name)}</strong><div class="small">${escapeHtml(d.phone)} — ${first.distance_km} km — est ${first.est_min} min ${first.shift_ok ? '' : '<span style="color:#b36b00">(shift close)</span>'}</div></div>
+    <div><button class="btn" data-select="${d.id}">Select</button></div>`;
+  box.appendChild(el);
+  assign_context.selected_driver_id = d.id;
+  candidates.slice(1).forEach(c=>{
+    const dd=c.driver;
+    const x = document.createElement('div'); x.className='driver-item';
+    x.innerHTML = `<div><strong>${escapeHtml(dd.name)}</strong><div class="small">${escapeHtml(dd.phone)} — ${c.distance_km} km</div></div><div><button class="btn ghost" data-select="${dd.id}">Select</button></div>`;
+    box.appendChild(x);
+  });
+  box.querySelectorAll('[data-select]').forEach(b=>{ b.removeEventListener('click', selectDriverHandler); b.addEventListener('click', selectDriverHandler); });
 }
 
 function renderAllDrivers(drivers){
-    const box = document.getElementById('allDriversBox'); box.innerHTML = '';
-    drivers.filter(d=>d.status==='available').forEach(d=>{
-        const el = document.createElement('div'); el.className='driver-item';
-        el.innerHTML = `<div><strong>${escapeHtml(d.name)}</strong><div style="font-size:13px;color:#666">${escapeHtml(d.phone)} — ${d.rating_average}★</div></div>
-            <div><button class="btn ghost" data-select="${d.id}">Select</button></div>`;
-        box.appendChild(el);
-    });
-    box.querySelectorAll('[data-select]').forEach(b=>{ b.removeEventListener('click', selectDriverHandler); b.addEventListener('click', selectDriverHandler); });
+  const box = document.getElementById('allDriversBox'); box.innerHTML = '';
+  drivers.filter(d=>d.status==='available').forEach(d=>{
+    const el = document.createElement('div'); el.className='driver-item';
+    el.innerHTML = `<div><strong>${escapeHtml(d.name)}</strong><div class="small">${escapeHtml(d.phone)} — ${d.rating_average}★</div></div>
+      <div><button class="btn ghost" data-select="${d.id}">Select</button></div>`;
+    box.appendChild(el);
+  });
+  box.querySelectorAll('[data-select]').forEach(b=>{ b.removeEventListener('click', selectDriverHandler); b.addEventListener('click', selectDriverHandler); });
 }
 
-function selectDriverHandler(e){ const id = parseInt(e.currentTarget.getAttribute('data-select')); assign_context.selected_driver_id = id; /* visual highlight could be added */ }
+function selectDriverHandler(e){ const id = parseInt(e.currentTarget.getAttribute('data-select')); assign_context.selected_driver_id = id; }
 
 document.getElementById('assignConfirmBtn').addEventListener('click', async ()=>{
-    const tid = assign_context.trip_id; const did = assign_context.selected_driver_id;
-    if(!did) return alert('Please select a driver first.');
-    const res = await apiPost('assignDriver', { trip_id: tid, driver_id: did });
-    if(res.error) return alert('Error: '+res.error);
-    if(res.warning) alert(res.warning);
-    closeModal('assignModal');
-    refreshAll();
+  const tid = assign_context.trip_id; const did = assign_context.selected_driver_id;
+  if(!did) return alert('Please select a driver first.');
+  const res = await apiPost('assignDriver', { trip_id: tid, driver_id: did });
+  if(res.error) return alert('Error: '+res.error);
+  if(res.warning) alert(res.warning);
+  closeModal('assignModal');
+  refreshAll();
 });
 
 /* assign search filter */
 document.getElementById('assign_search').addEventListener('input', function(){
-    const q = this.value.toLowerCase();
-    document.querySelectorAll('#allDriversBox .driver-item').forEach(it=>{
-        it.style.display = it.innerText.toLowerCase().includes(q) ? '' : 'none';
-    });
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('#allDriversBox .driver-item').forEach(it=>{
+    it.style.display = it.innerText.toLowerCase().includes(q) ? '' : 'none';
+  });
 });
 document.getElementById('refreshDriversBtn').addEventListener('click', refreshDrivers);
 
 /* quick assign buttons */
 document.addEventListener('click', e=>{
-    const a = e.target;
-    if(a && a.matches('[data-quickassign]')) quickAssignHandler({currentTarget: a});
+  const a = e.target;
+  if(a && a.matches('[data-quickassign]')) quickAssignHandler({currentTarget: a});
 });
 
 /* quick refresh */
@@ -602,14 +729,13 @@ document.getElementById('refreshBtn').addEventListener('click', refreshAll);
 
 /* SMS stub */
 document.getElementById('smsBtn').addEventListener('click', async ()=>{
-    const to = document.getElementById('sms_to').value, msg = document.getElementById('sms_msg').value;
-    const res = await apiPost('sendSMS', { to, message: msg });
-    document.getElementById('smsResult').innerText = JSON.stringify(res);
+  const to = document.getElementById('sms_to').value, msg = document.getElementById('sms_msg').value;
+  const res = await apiPost('sendSMS', { to, message: msg });
+  document.getElementById('smsResult').innerText = JSON.stringify(res);
 });
 
 /* init */
 refreshAll();
-
 </script>
 </body>
 </html>
