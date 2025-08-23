@@ -39,13 +39,13 @@ if (isset($_POST['verify'])) {
                     header("Location: dispatcher/dispatcher_dashboard.php");
                     break;
                 case 'admin1': // Operations Manager
-                    header("Location: operations/dashboard.php");
+                    header("Location: operations/operator_dashboard.php");
                     break;
                 case 'fleetstaff':
-                    header("Location: fleet/dashboard.php");
+                    header("Location: fleet/fleet_dashboard.php");
                     break;
                 case 'storeclerk':
-                    header("Location: store_clerk/dashboard.php");
+                    header("Location: store_clerk/storeroom_dashboard.php");
                     break;
                 default:
                     header("Location: dashboard.php"); // fallback
