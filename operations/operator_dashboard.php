@@ -3,41 +3,18 @@
  * Viahale Ops Manager Dashboard (single-file)
  * - Multi-tab overview for Dispatcher, Fleet, Storeroom
  * - Driver Information System (HR link)
- * - Enhancements implemented:
- *   • Performance KPIs (trips, earnings*, fuel, vehicle availability)
- *   • Incident Tracker (accidents/complaints/commendations)
- *   • Predictive Maintenance Alerts (heuristic risk score)
- *   • Budget vs Actual (fuel/repairs/supplies)
- *   • Approval Workflow (high-value fuel/supplies)
+ *
  * Notes:
  *  - Uses your existing tables; creates a few helper tables if missing.
  *  - Keep black theme; Viahale accent = #00E0B8
  ****************************************************/
-
-// ---------- CONFIG ----------
-$DB_HOST = 'localhost';
-$DB_PORT = '3307';
-$DB_NAME = 'otp_login';
-$DB_USER = 'root';
-$DB_PASS = '';
+require_once __DIR__ . '/../includes/db_connect.php';
+require_once __DIR__ . '/../includes/auth.php';
+require_role('admin1');
 $VIABRAND = '#6532C9';
 $BASE_FARE_PER_COMPLETED_TRIP = 150.00;   // used if trips table doesn't have an amount column
 $HIGH_VALUE_FUEL = 3000.00;               // PHP threshold for approvals
 $HIGH_VALUE_SUPPLY = 5000.00;             // PHP threshold for approvals
-
-// ---------- DB CONNECT ----------
-$pdo = null;
-try {
-    $dsn = "mysql:host=$DB_HOST;port=$DB_PORT;dbname=$DB_NAME;charset=utf8mb4";
-    $pdo = new PDO($dsn, $DB_USER, $DB_PASS, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
-    ]);
-} catch (Exception $e) {
-    http_response_code(500);
-    echo "DB connection failed: " . htmlspecialchars($e->getMessage());
-    exit;
-}
 
 // ---------- LIGHT MIGRATIONS (safe, IF NOT EXISTS) ----------
 try {
@@ -149,7 +126,8 @@ try {
 }
 
 // ---------- HELPERS ----------
-function json_out($data) {
+function json_out($data, $code = 200) {
+    http_response_code($code);
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode($data);
     exit;
@@ -174,13 +152,12 @@ function table_exists(PDO $pdo, $table) {
 // ---------- API ----------
 $action = $_GET['action'] ?? null;
 if ($action) {
-    // who is the user? (optional; if you have auth session, read it)
     $username = 'ops_manager';
 
-    // ------- Dashboard Overview -------
+    // Unified Overview
     if ($action === 'getOverview') {
         try {
-            // Trips summary
+            // Trips
             $tripCounts = ['total'=>0,'completed'=>0,'cancelled'=>0,'ongoing'=>0,'pending'=>0];
             if (table_exists($pdo, 'trips') && col_exists($pdo,'trips','status')) {
                 $rows = $pdo->query("SELECT status, COUNT(*) cnt FROM trips GROUP BY status")->fetchAll();
@@ -188,18 +165,15 @@ if ($action) {
                 foreach ($rows as $r) { $tripCounts[$r['status']] = (int)$r['cnt']; $all += (int)$r['cnt']; }
                 $tripCounts['total'] = $all;
             }
-
-            // Earnings (prefer real column if present)
+            // Earnings
             $earnings = 0.00;
             if (table_exists($pdo,'trips') && col_exists($pdo,'trips','amount')) {
                 $earnings = (float)$pdo->query("SELECT COALESCE(SUM(amount),0) FROM trips WHERE status='completed'")->fetchColumn();
             } else {
-                // estimate
                 $completed = $tripCounts['completed'] ?? 0;
                 $earnings = $completed * $BASE_FARE_PER_COMPLETED_TRIP;
             }
-
-            // Vehicles availability
+            // Fleet
             $fleet = ['total'=>0,'available'=>0,'in_use'=>0,'maintenance'=>0];
             if (table_exists($pdo,'vehicles') && col_exists($pdo,'vehicles','status')) {
                 $f = $pdo->query("
@@ -210,10 +184,15 @@ if ($action) {
                       SUM(status='maintenance') maintenance
                     FROM vehicles
                 ")->fetch();
-                $fleet = array_map('intval', $f);
+                // convert values to ints safely
+                $fleet = [
+                    'total' => isset($f['total']) ? (int)$f['total'] : 0,
+                    'available' => isset($f['available']) ? (int)$f['available'] : 0,
+                    'in_use' => isset($f['in_use']) ? (int)$f['in_use'] : 0,
+                    'maintenance' => isset($f['maintenance']) ? (int)$f['maintenance'] : 0
+                ];
             }
-
-            // Fuel last 30 days
+            // Fuel
             $fuel = ['liters'=>0.0,'cost'=>0.0];
             if (table_exists($pdo,'fuel_logs')) {
                 $fuel = $pdo->query("
@@ -221,20 +200,52 @@ if ($action) {
                     FROM fuel_logs
                     WHERE filled_at >= NOW() - INTERVAL 30 DAY
                 ")->fetch();
-                $fuel['liters'] = (float)$fuel['liters'];
-                $fuel['cost'] = (float)$fuel['cost'];
+                $fuel['liters'] = (float)($fuel['liters'] ?? 0);
+                $fuel['cost'] = (float)($fuel['cost'] ?? 0);
             }
-
             json_out([
                 'trips'=>$tripCounts,
                 'earnings'=>round($earnings,2),
                 'fleet'=>$fleet,
                 'fuel'=>$fuel
             ]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
 
-    // ------- Drivers (HR) -------
+    // tripsSummary (for Chart.js) - returns last N months summary
+    if ($action === 'tripsSummary') {
+        $months = isset($_GET['months']) ? (int)$_GET['months'] : 6;
+        $months = max(1, min(24, $months));
+        try {
+            if (!table_exists($pdo,'trips')) {
+                json_out(['labels'=>[],'data'=>[]]);
+            }
+            // Build last N months labels in PHP to ensure months with 0 are present
+            $labels = [];
+            $periods = [];
+            for ($i = $months-1; $i >= 0; $i--) {
+                $dt = new DateTime("-{$i} months");
+                $ym = $dt->format('Y-m');
+                $labels[] = $dt->format('M Y');
+                $periods[] = $ym;
+            }
+            // Query counts grouped by year-month
+            $placeholders = implode(',', array_fill(0, count($periods), '?'));
+            $st = $pdo->prepare("
+                SELECT DATE_FORMAT(created_at,'%Y-%m') ym, COUNT(*) cnt
+                FROM trips
+                WHERE DATE_FORMAT(created_at,'%Y-%m') IN ($placeholders)
+                GROUP BY ym
+            ");
+            $st->execute($periods);
+            $rows = $st->fetchAll(PDO::FETCH_KEY_PAIR); // ym => cnt
+            $data = [];
+            foreach ($periods as $p) $data[] = isset($rows[$p]) ? (int)$rows[$p] : 0;
+            json_out(['labels'=>$labels,'data'=>$data, 'raw_month_codes'=>$periods]);
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
+    }
+
+    // DIS: Driver Info System (separated)
     if ($action === 'fetchDriversHR') {
         try {
             $rows = $pdo->query("
@@ -250,24 +261,24 @@ if ($action) {
                 ORDER BY d.id ASC
             ")->fetchAll();
             json_out(['drivers'=>$rows]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
 
-    // ------- Incidents -------
-if ($action === 'fetchIncidents') {
-    try {
-        $rows = $pdo->query("
-            SELECT di.*,
-                   COALESCE(d.name, CONCAT(dp.first_name, ' ', dp.last_name)) AS driver_name
-            FROM driver_incidents di
-            LEFT JOIN drivers d       ON d.id = di.driver_id
-            LEFT JOIN driver_profiles dp ON dp.driver_id = di.driver_id
-            ORDER BY di.reported_at DESC
-            LIMIT 300
-        ")->fetchAll();
-        json_out(['incidents'=>$rows]);
-    } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
-}
+    // Incidents
+    if ($action === 'fetchIncidents') {
+        try {
+            $rows = $pdo->query("
+                SELECT di.*,
+                       COALESCE(d.name, CONCAT(dp.first_name, ' ', dp.last_name)) AS driver_name
+                FROM driver_incidents di
+                LEFT JOIN drivers d       ON d.id = di.driver_id
+                LEFT JOIN driver_profiles dp ON dp.driver_id = di.driver_id
+                ORDER BY di.reported_at DESC
+                LIMIT 300
+            ")->fetchAll();
+            json_out(['incidents'=>$rows]);
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
+    }
     if ($action === 'addIncident' && $_SERVER['REQUEST_METHOD']==='POST') {
         $b = json_decode(file_get_contents('php://input'), true) ?: [];
         $driver_id = (int)($b['driver_id'] ?? 0);
@@ -275,50 +286,42 @@ if ($action === 'fetchIncidents') {
         $desc = trim($b['description'] ?? '');
         $severity = $b['severity'] ?? 'low';
         if (!$driver_id || !in_array($type,['accident','complaint','commendation'],true)) {
-            json_out(['error'=>'driver_id and valid incident_type required']); }
+            json_out(['error'=>'driver_id and valid incident_type required'], 400); }
         try {
             $st = $pdo->prepare("INSERT INTO driver_incidents (driver_id, incident_type, description, severity, reported_by) VALUES (:d,:t,:x,:s,:u)");
             $st->execute(['d'=>$driver_id,'t'=>$type,'x'=>$desc,'s'=>$severity,'u'=>$username]);
             json_out(['success'=>true]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
     if ($action === 'updateIncident' && $_SERVER['REQUEST_METHOD']==='POST') {
         $b = json_decode(file_get_contents('php://input'), true) ?: [];
         $id = (int)($b['id'] ?? 0);
         $status = $b['status'] ?? null;
-        if (!$id || !in_array($status,['open','in_review','closed'],true)) json_out(['error'=>'invalid']);
+        if (!$id || !in_array($status,['open','in_review','closed'],true)) json_out(['error'=>'invalid'], 400);
         try {
             $st = $pdo->prepare("UPDATE driver_incidents SET status=:s WHERE id=:id");
             $st->execute(['s'=>$status,'id'=>$id]);
             json_out(['success'=>true]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
 
-    // ------- Fleet & Predictive Alerts -------
+    // Fleet & Predictive Alerts
     if ($action === 'fetchFleet') {
         try {
             $vehicles = $pdo->query("SELECT * FROM vehicles ORDER BY status DESC, plate_no ASC")->fetchAll();
-
-            // predictive risk: recent repair count + overdue schedule + high mileage rate
             $alerts = [];
             $since = (new DateTime('-60 days'))->format('Y-m-d H:i:s');
-
-            // recent repairs per vehicle
             $repairs = [];
             if (table_exists($pdo,'repair_logs')) {
                 $r = $pdo->query("SELECT vehicle_id, COUNT(*) c FROM repair_logs WHERE log_date >= '$since' GROUP BY vehicle_id")->fetchAll();
                 foreach ($r as $row) $repairs[(int)$row['vehicle_id']] = (int)$row['c'];
             }
-
-            // overdue scheduled maint
             $overdue = [];
             if (table_exists($pdo,'maintenance_schedule')) {
                 $o = $pdo->query("SELECT vehicle_id, COUNT(*) c FROM maintenance_schedule WHERE status IN ('scheduled') AND scheduled_date < CURDATE() GROUP BY vehicle_id")->fetchAll();
                 foreach ($o as $row) $overdue[(int)$row['vehicle_id']] = (int)$row['c'];
             }
-
-            // mileage/day proxy from fuel logs
-            $kmday = []; // km per day
+            $kmday = [];
             if (table_exists($pdo,'fuel_logs')) {
                 $km = $pdo->query("
                     SELECT vehicle_id,
@@ -330,13 +333,12 @@ if ($action === 'fetchIncidents') {
                 ")->fetchAll();
                 foreach ($km as $row) $kmday[(int)$row['vehicle_id']] = max(0, (float)$row['km_per_day']);
             }
-
             foreach ($vehicles as $v) {
                 $vid = (int)$v['id'];
                 $score = 0.0;
                 $score += ($repairs[$vid] ?? 0) * 0.5;
                 $score += ($overdue[$vid] ?? 0) * 0.8;
-                $score += ($kmday[$vid] ?? 0)/300.0; // if >300km/day → +1
+                $score += ($kmday[$vid] ?? 0)/300.0;
                 if ($score >= 1.0) {
                     $alerts[] = [
                         'vehicle_id'=>$vid,
@@ -350,12 +352,11 @@ if ($action === 'fetchIncidents') {
                     ];
                 }
             }
-
             json_out(['vehicles'=>$vehicles,'alerts'=>$alerts]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
 
-    // ------- Fuel (logs + efficiency) -------
+    // Fuel logs + efficiency
     if ($action === 'fetchFuel') {
         try {
             $logs = $pdo->query("
@@ -366,8 +367,6 @@ if ($action === 'fetchIncidents') {
                 ORDER BY fl.filled_at DESC
                 LIMIT 300
             ")->fetchAll();
-
-            // efficiency per vehicle (last 60d)
             $eff = [];
             $rows = $pdo->query("
                 SELECT vehicle_id,
@@ -382,10 +381,9 @@ if ($action === 'fetchIncidents') {
                 $l  = (float)$r['liters'];
                 $eff[(int)$r['vehicle_id']] = ($l>0 ? round($km/$l,2) : null);
             }
-
             $cost30 = $pdo->query("SELECT COALESCE(SUM(cost),0) FROM fuel_logs WHERE filled_at >= NOW() - INTERVAL 30 DAY")->fetchColumn();
             json_out(['logs'=>$logs,'efficiency'=>$eff,'cost30'=>round((float)$cost30,2)]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
     if ($action === 'addFuelLog' && $_SERVER['REQUEST_METHOD']==='POST') {
         $b = json_decode(file_get_contents('php://input'), true) ?: [];
@@ -397,42 +395,36 @@ if ($action === 'fetchIncidents') {
         $oa  = isset($b['odometer_after']) ? (int)$b['odometer_after'] : null;
         $stn = trim($b['station'] ?? '');
         $nts = trim($b['notes'] ?? '');
-        if ($vid<=0 || $lit<=0 || $cost<=0) json_out(['error'=>'vehicle_id, liters, cost required']);
+        if ($vid<=0 || $lit<=0 || $cost<=0) json_out(['error'=>'vehicle_id, liters, cost required'], 400);
         try {
             $st = $pdo->prepare("INSERT INTO fuel_logs (vehicle_id, driver_id, liters, cost, odometer_before, odometer_after, station, notes, created_by) VALUES (:v,:d,:l,:c,:ob,:oa,:s,:n,:u)");
             $st->execute(['v'=>$vid,'d'=>$did,'l'=>$lit,'c'=>$cost,'ob'=>$ob,'oa'=>$oa,'s'=>$stn,'n'=>$nts,'u'=>$username]);
-
-            // create approval if high value
             if ($cost >= $HIGH_VALUE_FUEL) {
-                $pdo->prepare("INSERT IGNORE INTO approvals (entity_type, entity_id, amount, requested_by) VALUES ('fuel', LAST_INSERT_ID(), :amt, :u)")
-                    ->execute(['amt'=>$cost,'u'=>$username]);
+                // Use the last inserted id for fuel_logs as entity_id in approvals
+                $lastFuelId = $pdo->lastInsertId();
+                $pdo->prepare("INSERT IGNORE INTO approvals (entity_type, entity_id, amount, requested_by) VALUES ('fuel', :eid, :amt, :u)")
+                    ->execute(['eid'=>$lastFuelId,'amt'=>$cost,'u'=>$username]);
             }
-
             json_out(['success'=>true]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
 
-    // ------- Budget vs Actual -------
+    // Budget vs Actual
     if ($action === 'fetchBudget') {
         $month = $_GET['month'] ?? date('Y-m');
         try {
-            // budgets
             $bud = $pdo->prepare("SELECT category, amount FROM budgets WHERE month_year=:m");
             $bud->execute(['m'=>$month]);
             $budget = ['fuel'=>0.0,'repairs'=>0.0,'supplies'=>0.0];
             foreach ($bud->fetchAll() as $b) $budget[$b['category']] = (float)$b['amount'];
-
-            // actual fuel
             $fuel = 0.0;
             if (table_exists($pdo,'fuel_logs')) {
                 $fuel = (float)$pdo->query("SELECT COALESCE(SUM(cost),0) FROM fuel_logs WHERE DATE_FORMAT(filled_at,'%Y-%m') = ".$pdo->quote($month))->fetchColumn();
             }
-            // actual repairs
             $repairs = 0.0;
             if (table_exists($pdo,'repair_logs') && col_exists($pdo,'repair_logs','cost')) {
                 $repairs = (float)$pdo->query("SELECT COALESCE(SUM(cost),0) FROM repair_logs WHERE DATE_FORMAT(log_date,'%Y-%m') = ".$pdo->quote($month))->fetchColumn();
             }
-            // actual supplies valuation (issued_items quantity * supply_prices.unit_price)
             $supplies = 0.0;
             if (table_exists($pdo,'issued_items') && table_exists($pdo,'supply_prices')) {
                 $supplies = (float)$pdo->query("
@@ -442,7 +434,6 @@ if ($action === 'fetchIncidents') {
                     WHERE DATE_FORMAT(ii.issued_at,'%Y-%m') = ".$pdo->quote($month)."
                 ")->fetchColumn();
             }
-
             json_out([
                 'month'=>$month,
                 'budget'=>$budget,
@@ -452,7 +443,7 @@ if ($action === 'fetchIncidents') {
                     'supplies'=>round($supplies,2),
                 ]
             ]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
     if ($action === 'saveBudget' && $_SERVER['REQUEST_METHOD']==='POST') {
         $b = json_decode(file_get_contents('php://input'), true) ?: [];
@@ -467,10 +458,10 @@ if ($action === 'fetchIncidents') {
                 $st->execute(['m'=>$month,'c'=>$cat,'a'=>$amt]);
             }
             json_out(['success'=>true]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
 
-    // ------- Approvals (high value fuel/supplies) -------
+    // Approvals
     if ($action === 'fetchApprovals') {
         try {
             $rows = $pdo->query("
@@ -484,35 +475,33 @@ if ($action === 'fetchIncidents') {
                 LIMIT 200
             ")->fetchAll();
             json_out(['approvals'=>$rows]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
     if ($action === 'decideApproval' && $_SERVER['REQUEST_METHOD']==='POST') {
         $b = json_decode(file_get_contents('php://input'), true) ?: [];
         $id = (int)($b['id'] ?? 0);
         $decision = $b['decision'] ?? '';
-        if (!$id || !in_array($decision,['approved','rejected'],true)) json_out(['error'=>'invalid']);
+        if (!$id || !in_array($decision,['approved','rejected'],true)) json_out(['error'=>'invalid'], 400);
         try {
             $st = $pdo->prepare("UPDATE approvals SET status=:s, decided_by=:u, decided_at=NOW() WHERE id=:id");
             $st->execute(['s'=>$decision,'u'=>$username,'id'=>$id]);
             json_out(['success'=>true]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
-
-    // ------- Create approval for supply manually (optional) -------
     if ($action === 'flagSupplyForApproval' && $_SERVER['REQUEST_METHOD']==='POST') {
         $b = json_decode(file_get_contents('php://input'), true) ?: [];
         $issued_id = (int)($b['issued_id'] ?? 0);
         $amount = (float)($b['amount'] ?? 0);
-        if ($issued_id<=0 || $amount<=0) json_out(['error'=>'issued_id and amount required']);
+        if ($issued_id<=0 || $amount<=0) json_out(['error'=>'issued_id and amount required'], 400);
         try {
             $pdo->prepare("INSERT IGNORE INTO approvals (entity_type, entity_id, amount, requested_by) VALUES ('supply', :id, :amt, :u)")
                 ->execute(['id'=>$issued_id, 'amt'=>$amount, 'u'=>$username]);
             json_out(['success'=>true]);
-        } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+        } catch (Exception $e) { json_out(['error'=>$e->getMessage()], 500); }
     }
 
-    // fallthrough unknown
-    json_out(['error'=>'Unknown action']);
+    // Unknown
+    json_out(['error'=>'Unknown action'], 404);
 }
 
 // ---------- UI ----------
@@ -559,7 +548,11 @@ if ($action === 'fetchIncidents') {
     .chip{display:inline-flex;align-items:center;gap:6px;background:var(--chip);border:1px solid var(--border);padding:4px 8px;border-radius:999px;font-size:12px}
     .status-ok{color:var(--ok)} .status-warn{color:var(--warn)} .status-bad{color:var(--danger)}
     .muted{color:var(--muted)}
+    /* Chart area */
+    #tripsChartWrap{height:220px;padding:6px}
 </style>
+<!-- Chart.js CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <div class="layout">
@@ -577,7 +570,9 @@ if ($action === 'fetchIncidents') {
         <!-- OVERVIEW -->
         <section id="tab-overview" class="tab">
             <div class="grid cols-3">
-                <div class="card"><h3>Trips (30d)</h3><div class="kpi"><div class="v" id="ov-trips-total">–</div><div class="s">total</div></div><div class="muted">Completed: <span id="ov-trips-completed">–</span> · Ongoing: <span id="ov-trips-ongoing">–</span> · Pending: <span id="ov-trips-pending">–</span> · Cancelled: <span id="ov-trips-cancelled">–</span></div></div>
+                <div class="card"><h3>Trips (30d)</h3><div class="kpi"><div class="v" id="ov-trips-total">–</div><div class="s">total</div></div><div class="muted">Completed: <span id="ov-trips-completed">–</span> · Ongoing: <span id="ov-trips-ongoing">–</span> · Pending: <span id="ov-trips-pending">–</span> · Cancelled: <span id="ov-trips-cancelled">–</span></div>
+                    <div id="tripsChartWrap"><canvas id="tripsChart"></canvas></div>
+                </div>
                 <div class="card"><h3>Earnings (est.)</h3><div class="kpi"><div class="v">₱<span id="ov-earnings">–</span></div><div class="s">completed trips</div></div></div>
                 <div class="card"><h3>Fuel (30d)</h3><div class="kpi"><div class="v"><span id="ov-fuel-liters">–</span>L</div><div class="s">₱<span id="ov-fuel-cost">–</span></div></div></div>
             </div>
@@ -592,9 +587,10 @@ if ($action === 'fetchIncidents') {
                     <div class="toolbar">
                         <a class="btn ghost" href="../dispatcher/dispatcher_dashboard.php" target="_blank">Open Dispatcher</a>
                         <a class="btn ghost" href="../fleet/fleet_dashboard.php" target="_blank">Open Fleet Staff</a>
-                        <a class="btn ghost" href="../storeroom/storeroom_dashboard.php" target="_blank">Open Storeroom</a>
+                        <a class="btn ghost" href="../store_clerk/storeroom_dashboard.php" target="_blank">Open Storeroom</a>
+                        <button class="btn" id="exportSummaryBtn">Export Ops Summary (print/PDF)</button>
                     </div>
-                    <div class="muted">These open the dedicated role dashboards. Ops overview pulls data directly from the same DB.</div>
+                    <div class="muted">These open the dedicated role dashboards. Ops overview pulls data directly from the same DB. Use Export to open a printable report (then Save as PDF).</div>
                 </div>
             </div>
         </section>
@@ -605,6 +601,7 @@ if ($action === 'fetchIncidents') {
                 <h3>Driver Information System</h3>
                 <div class="toolbar">
                     <input id="drv-filter" placeholder="Search name, email, license…" style="min-width:260px" />
+                    <button class="btn ghost" id="exportDriversBtn">Export drivers (CSV)</button>
                 </div>
                 <div style="overflow:auto">
                     <table id="tbl-drivers">
@@ -749,14 +746,46 @@ if ($action === 'fetchIncidents') {
 const fmt = n => (Number(n||0)).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});
 const money = n => (Number(n||0)).toLocaleString(undefined,{style:'decimal',minimumFractionDigits:2,maximumFractionDigits:2});
 
+// API helper - accepts either 'actionName' or 'fetchBudget&month=YYYY-MM' or '?action=...&param=...'
+async function api(path, body) {
+  // Build URL correctly:
+  let url;
+  if (path.startsWith('?')) {
+    url = path;
+  } else if (path.includes('?') || path.includes('&')) {
+    // allow "fetchBudget&month=2025-08" or "fetchBudget?month=2025-08"
+    if (path.indexOf('?') === -1) url = '?action=' + encodeURIComponent(path.replace('&', '&'));
+    else url = '?' + path;
+    // If it still doesn't have action= we ensure it's in the query
+    if (!url.includes('action=')) {
+      const parts = url.replace(/^\?/, '');
+      url = '?action=' + encodeURIComponent(parts.split(/[&=]/)[0]) + '&' + parts.split('&').slice(1).join('&');
+    }
+  } else {
+    url = '?action=' + encodeURIComponent(path);
+  }
+
+  const opt = body ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)} : {};
+  const r = await fetch(url, opt);
+  const txt = await r.text();
+  try {
+    return JSON.parse(txt);
+  } catch (e) {
+    console.warn('API non-JSON response', txt);
+    return { error: 'Invalid response from server' };
+  }
+}
+
+// NAV
 document.querySelectorAll('.nav button').forEach(btn=>{
   btn.addEventListener('click', ()=>{
     document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
     const t = btn.dataset.tab;
     document.querySelectorAll('.tab').forEach(sec=>sec.style.display='none');
-    document.getElementById('tab-'+t).style.display='';
-    if (t==='overview') loadOverview();
+    const el = document.getElementById('tab-'+t);
+    if (el) el.style.display='';
+    if (t==='overview') { loadOverview(); loadTripsChart(); }
     if (t==='drivers') loadDrivers();
     if (t==='fleet') loadFleet();
     if (t==='fuel') loadFuel();
@@ -766,13 +795,8 @@ document.querySelectorAll('.nav button').forEach(btn=>{
   });
 });
 
-async function api(path, body) {
-  const opt = body ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)} : {};
-  const r = await fetch('?action='+encodeURIComponent(path), opt);
-  return await r.json();
-}
-
 // OVERVIEW
+let tripsChartInstance = null;
 async function loadOverview(){
   const d = await api('getOverview');
   if (d.error){ console.warn(d.error); return; }
@@ -789,6 +813,70 @@ async function loadOverview(){
   document.getElementById('ov-fleet-inuse').textContent = fmt(d.fleet.in_use||0);
   document.getElementById('ov-fleet-maint').textContent = fmt(d.fleet.maintenance||0);
 }
+
+// TRIPS CHART
+async function loadTripsChart(months = 6) {
+  const d = await api('?action=tripsSummary&months=' + encodeURIComponent(months));
+  if (d.error) { console.warn(d.error); return; }
+  const ctx = document.getElementById('tripsChart').getContext('2d');
+  if (tripsChartInstance) tripsChartInstance.destroy();
+  tripsChartInstance = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: d.labels || [],
+      datasets: [{
+        label: 'Trips',
+        data: d.data || [],
+        borderRadius: 6,
+        barThickness: 18,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { display: false } },
+        y: { grid: { color: '#0a0e11' }, beginAtZero: true }
+      }
+    }
+  });
+}
+
+// EXPORT printable summary (opens new window with printable HTML then invokes print)
+document.getElementById('exportSummaryBtn').addEventListener('click', async function(){
+  // gather overview and trips summary (6 months)
+  const [ov, trips] = await Promise.all([ api('getOverview'), api('?action=tripsSummary&months=6') ]);
+  if (ov.error || trips.error) { alert('Failed to gather data for summary'); return; }
+
+  const html = `
+    <html><head><title>Ops Summary — ViaHale</title>
+    <style>
+     body{font-family:Inter,Arial,Helvetica,sans-serif;color:#111;background:#fff;margin:20px}
+     h1{margin:0 0 10px}
+     .k{font-size:16px;margin:6px 0}
+     table{width:100%;border-collapse:collapse;margin-top:12px}
+     th,td{border:1px solid #ddd;padding:8px;text-align:left}
+    </style>
+    </head><body>
+    <h1>ViaHale — Ops Summary</h1>
+    <div class="k"><strong>Trips (30d):</strong> ${ov.trips.total} (completed: ${ov.trips.completed || 0})</div>
+    <div class="k"><strong>Earnings (est):</strong> ₱${Number(ov.earnings||0).toFixed(2)}</div>
+    <div class="k"><strong>Fuel (30d):</strong> ${Number(ov.fuel.liters||0).toFixed(2)} L — ₱${Number(ov.fuel.cost||0).toFixed(2)}</div>
+    <h2>Trips (last ${trips.labels.length} months)</h2>
+    <table><thead><tr><th>Month</th><th>Trips</th></tr></thead><tbody>
+    ${trips.labels.map((lab,i)=>`<tr><td>${lab}</td><td>${trips.data[i]}</td></tr>`).join('')}
+    </tbody></table>
+    <p style="margin-top:20px;color:#666">Generated: ${new Date().toLocaleString()}</p>
+    </body></html>
+  `;
+  const w = window.open('', '_blank');
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+  // Give a short delay for resources to be ready, then call print
+  setTimeout(()=>{ w.print(); }, 500);
+});
 
 // DRIVERS
 let driversCache = [];
@@ -827,6 +915,17 @@ function renderDrivers(){
   });
 }
 document.getElementById('drv-filter').addEventListener('input', renderDrivers);
+document.getElementById('exportDriversBtn').addEventListener('click', ()=>{
+  if (!driversCache || driversCache.length === 0) return alert('No drivers loaded yet');
+  const cols = ['driver_id','driver_name','phone','driver_status','hr_employee_id','email','license_number','license_expiry','employment_status','date_hired'];
+  const csv = [cols.join(',')].concat(
+    driversCache.map(r => cols.map(c => `"${String(r[c] ?? '').replace(/"/g,'""')}"`).join(','))
+  ).join('\n');
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'drivers_export.csv'; a.click();
+  URL.revokeObjectURL(url);
+});
 
 // FLEET
 async function loadFleet(){
@@ -913,7 +1012,8 @@ async function decideIncident(id, status){
 // BUDGET
 async function loadBudget(){
   const m = document.getElementById('bdg-month').value || new Date().toISOString().slice(0,7);
-  const d = await api('fetchBudget&month='+encodeURIComponent(m));
+  // call with query string style
+  const d = await api('fetchBudget&month=' + encodeURIComponent(m));
   if (d.error){ console.warn(d.error); return; }
   document.getElementById('bdg-fuel-a').textContent = money(d.actual.fuel);
   document.getElementById('bdg-rep-a').textContent = money(d.actual.repairs);
@@ -967,6 +1067,7 @@ async function decideApproval(id, decision){
 
 // initial
 loadOverview();
+loadTripsChart(6);
 </script>
 </body>
 </html>
