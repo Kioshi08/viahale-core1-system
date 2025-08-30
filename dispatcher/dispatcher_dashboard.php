@@ -1,48 +1,16 @@
 <?php
 // dispatcher_dashboard.php — ViaHale Dispatcher (Enhanced Single-File)
 // Adds: customer_contact, trip_assignments logging, reassign flow, complete/cancel, comms autofill.
-
-// ========== CONFIG ==========
-session_start();
-$DB_HOST = getenv('DB_HOST') ?: '127.0.0.1';
-$DB_PORT = getenv('DB_PORT') ?: '3307';
-$DB_NAME = getenv('DB_NAME') ?: 'otp_login';
-$DB_USER = getenv('DB_USER') ?: 'root';
-$DB_PASS = getenv('DB_PASS') ?: '';
+require_once __DIR__ . '/../includes/db_connect.php';
+require_once __DIR__ . '/../includes/auth.php';
+require_role('dispatcher'); // Only dispatcher or admin1
 $SOCKET_IO_URL = getenv('SOCKET_IO_URL') ?: 'http://localhost:3001';
-$NOMINATIM_EMAIL = getenv('NOMINATIM_EMAIL') ?: 'youremail@example.com'; // change to your contact email
+$NOMINATIM_EMAIL = getenv('NOMINATIM_EMAIL') ?: 'pyketyson42@gmail.com';
 
-// ViaHale branding
 $V_PRIMARY = '#6532C9';
 $V_DARK   = '#4311A5';
 $V_ACCENT = '#9A66FF';
 
-// ========== DB CONNECTION ==========
-try {
-    $pdo = new PDO("mysql:host={$DB_HOST};port={$DB_PORT};dbname={$DB_NAME};charset=utf8mb4", $DB_USER, $DB_PASS, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-} catch (Exception $e) {
-    http_response_code(500);
-    echo "DB connection failed: " . htmlspecialchars($e->getMessage());
-    exit;
-}
-
-// ========== AUTHORIZATION ==========
-$username = $_SESSION['username'] ?? null;
-if (!$username) { header('Location: login.php'); exit; }
-$allowed = false;
-try {
-    $q = $pdo->prepare("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = :db AND TABLE_NAME='users' AND COLUMN_NAME='role'");
-    $q->execute(['db' => $DB_NAME]);
-    if ($q->fetch()) {
-        $r = $pdo->prepare('SELECT role FROM users WHERE username=:u LIMIT 1');
-        $r->execute(['u' => $username]);
-        $row = $r->fetch(PDO::FETCH_ASSOC);
-        if ($row && $row['role'] === 'dispatcher') $allowed = true;
-    } else {
-        $allowed = in_array($username, ['dispatcher','admin1'], true);
-    }
-} catch (Exception $e) { $allowed = in_array($username, ['dispatcher','admin1'], true); }
-if (!$allowed) { http_response_code(403); echo 'Access denied'; exit; }
 
 // ========== UTILITIES ==========
 function notify_socket($type, $socketUrl) {
@@ -246,6 +214,34 @@ if ($action === 'updateDriverLocation' && $_SERVER['REQUEST_METHOD'] === 'POST')
     echo json_encode(['success'=>true]); exit;
 }
 
+// NEW: Set driver online/offline status (availability sync)
+if ($action === 'setDriverStatus' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $b = json_decode(file_get_contents('php://input'), true) ?: [];
+    $driver_id = (int)($b['driver_id'] ?? 0);
+    $status = $b['status'] ?? '';
+    if (!$driver_id || !in_array($status, ['available','offline','on_trip'], true)) {
+        echo json_encode(['error'=>'driver_id and valid status required']); exit;
+    }
+    $u = $pdo->prepare("UPDATE drivers SET status = :status WHERE id = :id");
+    $u->execute(['status'=>$status,'id'=>$driver_id]);
+    notify_socket('drivers', $SOCKET_IO_URL);
+    echo json_encode(['success'=>true]); exit;
+}
+
+// NEW: Send trip summary to DIS (stub)
+function sendTripSummaryToDIS($trip_id, $pdo) {
+    // Fetch trip details
+    $st = $pdo->prepare("SELECT t.*, d.name AS driver_name FROM trips t LEFT JOIN drivers d ON d.id = t.driver_id WHERE t.id=:id");
+    $st->execute(['id'=>$trip_id]);
+    $trip = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$trip) return false;
+    // Stub: Replace with actual DIS API call
+    // file_get_contents('http://dis.ops/api/receive_trip', ...);
+    // For now, just log to file
+    file_put_contents(__DIR__.'/dis_trip_log.txt', json_encode($trip)."\n", FILE_APPEND);
+    return true;
+}
+
 // Trip status: complete/cancel (frees driver)
 if ($action === 'updateTripStatus' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $b = json_decode(file_get_contents('php://input'), true) ?: [];
@@ -274,6 +270,11 @@ if ($action === 'updateTripStatus' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 $pdo->prepare("INSERT INTO trip_assignments (trip_id, driver_id, status) VALUES (:t,:d,'cancelled')")
                     ->execute(['t'=>$trip_id, 'd'=>$trip['driver_id']]);
             }
+            // NEW: On completed, update wallet & earnings
+            if ($new_status === 'completed') {
+                // Example: Add fixed earning, e.g. 100
+                $pdo->prepare("UPDATE drivers SET wallet = wallet + 100, earnings = earnings + 100 WHERE id=:d")->execute(['d'=>$trip['driver_id']]);
+            }
         }
 
         $pdo->commit();
@@ -281,6 +282,9 @@ if ($action === 'updateTripStatus' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->rollBack();
         echo json_encode(['error'=>'DB error: '.$e->getMessage()]); exit;
     }
+
+    // NEW: Send summary to DIS on completion
+    if ($new_status === 'completed') sendTripSummaryToDIS($trip_id, $pdo);
 
     notify_socket('trips', $SOCKET_IO_URL);
     notify_socket('drivers', $SOCKET_IO_URL);
@@ -499,10 +503,18 @@ async function refreshDrivers(){
   box.innerHTML = '';
   if(!res.drivers) return;
   res.drivers.forEach(d=>{
-    if(d.status === 'available'){
+    if(d.status === 'available' || d.status === 'offline'){
       const el = document.createElement('div'); el.className='driver-item';
-      el.innerHTML = `<div><strong>${escapeHtml(d.name)}</strong><div class="small">${escapeHtml(d.phone)} — ${d.rating_average}★</div></div>
-        <div style="display:flex;gap:6px"><button class="btn ghost" data-quickassign="${d.id}">Assign</button></div>`;
+      el.innerHTML = `<div><strong>${escapeHtml(d.name)}</strong>
+        <div class="small">${escapeHtml(d.phone)} — ${d.rating_average}★</div>
+        <div class="small">Status: <span id="driver-status-${d.id}">${escapeHtml(d.status)}</span></div>
+        <div style="margin-top:4px">
+          <button class="btn ghost" data-toggle-status="${d.id}" data-status="${d.status === 'available' ? 'offline' : 'available'}">
+            Set ${d.status === 'available' ? 'Offline' : 'Available'}
+          </button>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px"><button class="btn ghost" data-quickassign="${d.id}">Assign</button></div>`;
       box.appendChild(el);
     }
     // markers
@@ -518,6 +530,21 @@ async function refreshDrivers(){
           .addTo(map).bindPopup(`<b>${escapeHtml(d.name)}</b><br>${escapeHtml(d.phone)}<br>Status: ${escapeHtml(d.status)}`);
       }
     }
+  });
+
+  // Add event listeners for status toggle
+  document.querySelectorAll('[data-toggle-status]').forEach(btn=>{
+    btn.addEventListener('click', async (e)=>{
+      const driverId = btn.getAttribute('data-toggle-status');
+      const newStatus = btn.getAttribute('data-status');
+      const res = await apiPost('setDriverStatus', { driver_id: driverId, status: newStatus });
+      if(res.success){
+        document.getElementById('driver-status-'+driverId).innerText = newStatus;
+        refreshDrivers();
+      } else {
+        alert('Failed to update status: ' + (res.error || 'Unknown error'));
+      }
+    });
   });
 }
 
