@@ -7,33 +7,9 @@
  * - Auto migrations (non-destructive where possible)
  * - ViaHale color branding + dark UI
  *******************************************************/
-
-// ---------- CONFIG ----------
-session_start();
-$username = $_SESSION['username'] ?? 'fleetstaff';
-$DB_HOST = getenv('DB_HOST') ?: '127.0.0.1';
-$DB_PORT = getenv('DB_PORT') ?: '3307';
-$DB_NAME = getenv('DB_NAME') ?: 'otp_login';
-$DB_USER = getenv('DB_USER') ?: 'root';
-$DB_PASS = getenv('DB_PASS') ?: '';
-$DSN = "mysql:host={$DB_HOST};port={$DB_PORT};dbname={$DB_NAME};charset=utf8mb4";
-
-// ViaHale colors
-$V_PRIMARY = '#6532C9';
-$V_DARK   = '#4311A5';
-$V_ACCENT = '#9A66FF';
-
-// ---------- DB CONNECT ----------
-try {
-    $pdo = new PDO($DSN, $DB_USER, $DB_PASS, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
-    ]);
-} catch (Exception $e) {
-    http_response_code(500);
-    echo "DB connection failed: ".htmlspecialchars($e->getMessage());
-    exit;
-}
+require_once __DIR__ . '/../includes/db_connect.php';
+require_once __DIR__ . '/../includes/auth.php';
+require_role('fleetstaff', 'admin1'); // Only fleetstaff or admin1
 
 // ---------- LIGHT MIGRATIONS ----------
 try {
@@ -399,6 +375,45 @@ if ($action === 'analytics') {
     json_out(['cost'=>$cost,'replacements'=>$repl]);
 }
 
+// Supplies list from storeroom (integration)
+if ($action === 'supplies_list') {
+    try {
+        // Pull from storeroom items table
+        $rows = $pdo->query("SELECT id AS item_id, name AS item_name, stock_quantity AS stock, unit, unit_cost FROM items ORDER BY name ASC")->fetchAll();
+        json_out(['supplies'=>$rows]);
+    } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+}
+
+// Request supply (integration with storeroom requests)
+if ($action === 'request_supply' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $b = json_decode(file_get_contents('php://input'), true) ?: [];
+    $item_id = (int)($b['item_id'] ?? 0);
+    $quantity = (int)($b['quantity'] ?? 0);
+    $notes = trim($b['notes'] ?? '');
+    $vehicle_id = (int)($b['vehicle_id'] ?? 0);
+    if (!$item_id || $quantity <= 0) json_out(['error'=>'item_id and positive quantity required']);
+    try {
+        // Insert into storeroom requests table
+        $st = $pdo->prepare("INSERT INTO supply_requests (item_id, quantity, requested_by, note, vehicle_id, status) VALUES (:iid,:qty,:by,:note,:vid,'pending')");
+        $st->execute(['iid'=>$item_id,'qty'=>$quantity,'by'=>$username,'note'=>$notes,'vid'=>$vehicle_id]);
+        json_out(['success'=>true]);
+    } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+}
+
+// Preventive Maintenance Alerts (overdue/upcoming)
+if ($action === 'maintenance_alerts') {
+    try {
+        $alerts = $pdo->query("
+            SELECT ms.*, v.plate_no
+            FROM maintenance_schedule ms
+            JOIN vehicles v ON v.id = ms.vehicle_id
+            WHERE ms.status='scheduled' AND ms.scheduled_date <= CURDATE() + INTERVAL 14 DAY
+            ORDER BY ms.scheduled_date ASC
+        ")->fetchAll();
+        json_out(['alerts'=>$alerts]);
+    } catch (Exception $e) { json_out(['error'=>$e->getMessage()]); }
+}
+
 // Unknown action handler
 if ($action) { json_out(['error'=>'Unknown action']); }
 
@@ -581,6 +596,36 @@ h2{margin:0 0 8px 0;font-size:16px}
       <table class="table" id="replTable"><thead><tr><th>Plate</th><th>Part</th><th>Installed</th><th>Life</th><th>Next</th><th>Status</th></tr></thead><tbody></tbody></table>
     </div>
   </section>
+
+  <!-- Supplies Section -->
+  <section class="card span-6">
+    <h2>Supplies (Storeroom)</h2>
+    <div style="margin-bottom:8px">
+      <table class="table" id="supTable">
+        <thead><tr><th>Item</th><th>Stock</th><th>Unit</th><th>Price</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div style="margin-bottom:8px">
+      <select id="supItem" class="input"></select>
+      <input id="supQty" class="input" type="number" min="1" placeholder="Quantity">
+      <select id="supVehicle" class="input"></select>
+      <input id="supNotes" class="input" placeholder="Notes (optional)">
+      <button class="btn" onclick="requestSupply()">Request Supply</button>
+    </div>
+    <div id="supReqResult" class="small"></div>
+  </section>
+
+  <!-- Preventive Maintenance Alerts Section -->
+  <section class="card span-6">
+    <h2>Preventive Maintenance Alerts</h2>
+    <div class="scroll">
+      <table class="table" id="alertTable">
+        <thead><tr><th>Date</th><th>Plate</th><th>Type</th><th>Status</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
 </div>
 
 <script>
@@ -638,11 +683,13 @@ async function loadVehicles() {
   const msVehicle = document.getElementById('msVehicle'); msVehicle.innerHTML=''; msVehicle.appendChild(el('option',{value:''},'Select Vehicle'));
   const rpVehicle = document.getElementById('rpVehicle'); rpVehicle.innerHTML=''; rpVehicle.appendChild(el('option',{value:''},'Select Vehicle'));
   const fuelVehicle = document.getElementById('fuelVehicle'); fuelVehicle.innerHTML=''; fuelVehicle.appendChild(el('option',{value:''},'Select Vehicle'));
+  const vsel = document.getElementById('supVehicle'); vsel.innerHTML='';
   for (const v of vehicles) {
     const opt = el('option',{value:v.id}, v.plate_no);
     msVehicle.appendChild(opt.cloneNode(true));
     rpVehicle.appendChild(opt.cloneNode(true));
     fuelVehicle.appendChild(opt.cloneNode(true));
+    vsel.appendChild(opt.cloneNode(true));
   }
 }
 
@@ -775,9 +822,56 @@ async function loadAnalytics() {
   });
 }
 
-// helper to refresh everything
+// Supplies integration
+async function loadSupplies() {
+  const r = await api('supplies_list');
+  console.log('Supplies API:', r);
+  const tb = document.querySelector('#supTable tbody'); tb.innerHTML='';
+  const sel = document.getElementById('supItem'); sel.innerHTML='';
+  (r.supplies||[]).forEach(s=>{
+    tb.appendChild(el('tr',{},
+      el('td',{}, s.item_name ? String(s.item_name) : ''),
+      el('td',{}, s.stock !== undefined && s.stock !== null ? String(s.stock) : ''),
+      el('td',{}, s.unit ? String(s.unit) : ''),
+      el('td',{}, s.unit_cost !== undefined && s.unit_cost !== null ? Number(s.unit_cost).toFixed(2) : '—')
+    ));
+    sel.appendChild(el('option',{value:s.item_id}, s.item_name ? String(s.item_name) : ''));
+  });
+  // fill vehicles for request
+  const vsel = document.getElementById('supVehicle'); vsel.innerHTML='';
+  vehicles.forEach(v=>vsel.appendChild(el('option',{value:v.id},v.plate_no)));
+}
+
+async function requestSupply() {
+  const item_id = +document.getElementById('supItem').value;
+  const quantity = +document.getElementById('supQty').value;
+  const notes = document.getElementById('supNotes').value.trim();
+  const vehicle_id = +document.getElementById('supVehicle').value;
+  const r = await api('request_supply', {body:{item_id, quantity, notes, vehicle_id}});
+  document.getElementById('supReqResult').innerText = r.success ? 'Request submitted!' : (r.error||'Failed');
+}
+
+// Preventive Maintenance Alerts
+async function loadAlerts() {
+  const r = await api('maintenance_alerts');
+  const tb = document.querySelector('#alertTable tbody'); tb.innerHTML='';
+  (r.alerts||[]).forEach(a=>{
+    tb.appendChild(el('tr',{},el('td',{},a.scheduled_date),el('td',{},a.plate_no),el('td',{},a.type),el('td',{},a.status)));
+  });
+}
+
+// Update refreshAll to include new sections
 async function refreshAll() {
-  await Promise.all([loadOverview(), loadVehicles(), loadMaintenance(), loadRepairs(), loadFuel(), loadAnalytics()]);
+  await Promise.all([
+    loadOverview(),
+    loadVehicles(),
+    loadMaintenance(),
+    loadRepairs(),
+    loadFuel(),
+    loadAnalytics(),
+    loadSupplies(), // <-- this must be here!
+    loadAlerts()
+  ]);
 }
 
 // minimal drivers endpoint call (used to populate driver select)
