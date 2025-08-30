@@ -8,11 +8,12 @@ if (!isset($_SESSION['email'])) {
 }
 
 if (isset($_POST['verify'])) {
-    $email = $_SESSION['email'];
+    $user_id = $_SESSION['user_id'];
+    $session_token = $_SESSION['otp_token'];
     $entered_otp = $_POST['otp'];
 
-    $stmt = $conn->prepare("SELECT otp, otp_expiry FROM users WHERE email = ?");
-    $stmt->bind_param("s", $email);
+    $stmt = $conn->prepare("SELECT otp, otp_expiry FROM otp_sessions WHERE user_id = ? AND session_token = ?");
+    $stmt->bind_param("is", $user_id, $session_token);
     $stmt->execute();
     $result = $stmt->get_result();
 
@@ -22,15 +23,12 @@ if (isset($_POST['verify'])) {
         $otp_expiry = $row['otp_expiry'];
 
         if ($otp === $entered_otp && strtotime($otp_expiry) > time()) {
-            // OTP is valid
-
-            // ✅ Set session for OTP verification and activity timeout
             $_SESSION['otp_verified'] = true;
             $_SESSION['last_activity'] = time();
 
-            // Clear OTP fields (optional for security)
-            $clear = $conn->prepare("UPDATE users SET otp = NULL, otp_expiry = NULL WHERE email = ?");
-            $clear->bind_param("s", $email);
+            // Optionally delete OTP session
+            $clear = $conn->prepare("DELETE FROM otp_sessions WHERE user_id = ? AND session_token = ?");
+            $clear->bind_param("is", $user_id, $session_token);
             $clear->execute();
 
             // Redirect to success page
@@ -56,7 +54,7 @@ if (isset($_POST['verify'])) {
             $error = "Invalid or expired OTP.";
         }
     } else {
-        $error = "User not found.";
+        $error = "OTP session not found.";
     }
 }
 ?>
@@ -186,6 +184,11 @@ if (isset($_POST['verify'])) {
             Didn't get it? <a href="resend_otp.php">Resend OTP</a>
         </div>
     </div>
+
+    <script>
+    window.onload = function() {
+      document.querySelector('input[name="otp"]').focus();
+    };
+    </script>
 </body>
 </html>
-
