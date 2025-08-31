@@ -17,18 +17,20 @@ if (isset($_POST['login'])) {
 
     if ($result->num_rows === 1) {
         $user = $result->fetch_assoc();
-
-        // Store both username & email in session BEFORE OTP
-        $_SESSION['username'] = $user['username']; // from DB, ensures exact match
+        $_SESSION['user_id'] = $user['id'];
+        $_SESSION['username'] = $user['username'];
         $_SESSION['email']    = $user['email'];
         $_SESSION['role']     = $user['role'];
 
         $otp = rand(100000, 999999);
         $otp_expiry = date("Y-m-d H:i:s", strtotime("+5 minutes"));
+        $session_token = bin2hex(random_bytes(32));
+        $_SESSION['otp_token'] = $session_token;
 
-        $update = $conn->prepare("UPDATE users SET otp = ?, otp_expiry = ? WHERE username = ?");
-        $update->bind_param("sss", $otp, $otp_expiry, $username);
-        $update->execute();
+        // Insert OTP session
+        $stmt = $conn->prepare("INSERT INTO otp_sessions (user_id, session_token, otp, otp_expiry) VALUES (?, ?, ?, ?)");
+        $stmt->bind_param("isss", $user['id'], $session_token, $otp, $otp_expiry);
+        $stmt->execute();
 
         // Send OTP
         $mail = new PHPMailer(true);
@@ -51,8 +53,6 @@ if (isset($_POST['login'])) {
 
             $mail->send();
 
-            $_SESSION['username'] = $username;
-            $_SESSION['email'] = $user['email'];
             header("Location: verify_otp.php");
             exit();
         } catch (Exception $e) {
